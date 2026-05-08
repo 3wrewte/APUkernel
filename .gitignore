@@ -1,0 +1,36 @@
+# Build artifacts
+build/
+
+# Linux kernel source tree
+kernel-src/
+
+# Kernel module Kbuild intermediates (built in-place in kernel/)
+kernel/*.o
+kernel/*.mod
+kernel/*.mod.c
+kernel/*.ko
+kernel/Module.symvers
+kernel/modules.order
+
+# Root filesystem build staging (not the build scripts)
+rootfs-staging/
+rootfs-tmp/
+rootfs-work/
+rootfs-build/
+sysroot/
+initramfs/
+.rootfs-cache/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+\#*\#
+
+# Misc
+*.tmp
+*.log
+.cache/
+__pycache__/
