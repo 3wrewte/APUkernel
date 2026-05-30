@@ -2,10 +2,14 @@
 
 ## Project Goal
 
-Transform AMD A8-7500 APU into a machine where:
-- **x86 Steamroller cores** run ONLY the Linux kernel (Ring 0)
-- **GCN Compute Units** run ALL user-space programs (bash, python, etc.)
+Transform AMD A8-7500 APU into a heterogeneous system where:
+- **x86 Steamroller cores** (4×) run the Linux kernel (Ring 0) **and optionally user threads**
+- **GCN Compute Units** (6× Radeon R7) run user threads as wavefronts,
+  with zero-interrupt execution and native SIMD throughput
+- Threads can be spawned on either core type via `clone(CLONE_GCN)`;
+  CPU threads can fork GCN children and vice versa, transparent to the application
 - GCN vector units are treated like a wider SIMD unit (AVX-like), not an offload device
+- Write normal C / pthread code; the scheduler distributes work across CPU and GPU cores
 
 ---
 
@@ -15,7 +19,7 @@ Transform AMD A8-7500 APU into a machine where:
 |-----------|--------|
 | APU | AMD A8-7500 (Kaveri, FM2+) |
 | CPU cores | 4x x86 Steamroller |
-| GPU cores | 8x GCN 1.1 Compute Units (Radeon R7) |
+| GPU cores | 6x GCN 1.1 Compute Units (Radeon R7, 384 shaders) |
 | Memory model | hUMA — single unified physical address space |
 | GPU self-dispatch | hQ (HSA heterogeneous queueing) |
 | Kernel driver | amdkfd (upstream Linux 6.x) |
@@ -72,24 +76,32 @@ Rationale:
 Boot sequence:
 ```
 BIOS → GRUB → Linux kernel (x86, loads amdkfd)
-  → initramfs: small x86 init loads heteroken_module.ko
-  → module creates HSA queues, dispatches /sbin/init as GCN wavefront
-  → PID 1 and all fork()/exec() children run on GCN CUs
+  → initramfs: x86 init loads heteroken_module.ko
+  → /sbin/init runs as a normal x86 userspace process
+  → init forks children: default is x86, CLONE_GCN flag spawns GCN threads
+  → GCN threads communicate with kernel via mailbox (no SYSCALL instruction)
+  → Both x86 and GCN threads see the same virtual address space (hUMA)
 ```
 
 Rootfs composition:
 ```
 / (NFS root or local ext4)
-├── boot/          # kernel + initramfs (x86)
-├── lib/modules/   # kernel modules including heteroken_module.ko (x86)
-├── sbin/init      # GCN binary (amdgcn target), first user process
-├── bin/           # busybox compiled for amdgcn
-├── lib/           # musl libc compiled for amdgcn
-├── etc/           # minimal config files (text)
-└── usr/           # additional GCN user binaries
+├── boot/           # kernel + initramfs (x86)
+├── lib/modules/    # kernel modules including heteroken_module.ko (x86)
+├── sbin/init       # x86 binary (or script), first user process
+├── bin/            # busybox compiled for BOTH x86 AND amdgcn targets
+├── lib/            # glibc for x86, musl for amdgcn
+├── etc/            # minimal config files (text)
+└── usr/            # additional x86 and GCN user binaries
 ```
 
-systemd is excluded entirely. Init is a custom minimal program or busybox init compiled for amdgcn.
+systemd is excluded entirely. Init is busybox init or a minimal script.
+
+Rationale for allowing x86 user threads:
+- Avoids a "bootstrap deadlock" where init must dispatch itself to GCN before it can run
+- I/O-heavy and low-latency threads are better on x86; vector-heavy threads are better on GCN
+- The "no interrupt on GCN" invariant is independent; x86 user threads don't violate it
+- No code impact on syscall handlers: `do_syscall_64()` serves both x86 SYSCALL and GCN mailbox
 
 ### Mailbox Protocol
 
@@ -122,17 +134,47 @@ This is architecturally equivalent to:
 
 ### Kernel Modifications Scope
 
-**We do NOT rewrite the scheduler. We intercept the dispatch path.**
+**We do NOT rewrite the scheduler. We add a heterogeneous dispatch path.**
 
 | Kernel component | Modified? | How |
 |-----------------|-----------|-----|
-| `task_struct` | Augmented | Add field: `is_gcn_thread`, `mailbox_ptr`, `gcn_context` |
-| `do_fork()` / `copy_process()` | Augmented | New GCN threads get `is_gcn_thread=1`, allocate mailbox |
-| `__schedule()` / `context_switch()` | Intercepted | If `next->is_gcn_thread`, call `dispatch_to_gcn(next)` instead of `switch_to()` |
-| `do_syscall_64()` | NOT modified | Called from our mailbox poller, not from x86 trap entry |
+| `task_struct` | Augmented | Add fields: `core_type` (CPU_CORE / GCN_CU), `mailbox_ptr`, `gcn_context` |
+| `do_fork()` / `copy_process()` | Augmented | `CLONE_GCN` flag → child gets `core_type=GCN_CU`, allocates mailbox |
+| `__schedule()` / `context_switch()` | Intercepted | If `next->core_type == GCN_CU`, call `dispatch_to_gcn(next)` instead of `switch_to()` |
+| `do_syscall_64()` | NOT modified | Called from both x86 `entry_SYSCALL_64` and GCN mailbox poller — same entry point |
 | Page fault handler | Augmented | GCN page faults arrive via KFD trap → forwarded to x86 `do_page_fault()` |
-| Signal delivery | Augmented | Signals queued in mailbox, no `send_signal()` direct delivery |
+| Signal delivery | Augmented | Signals to x86 threads: normal path. Signals to GCN threads: queued in mailbox |
 | Interrupt handling | NOT modified | Interrupts physically cannot reach GCN CUs (no IRQ lines wired) |
+
+### Heterogeneous Scheduling Design
+
+```
+                    ┌── pick_next_task() ──┐
+                    │                      │
+              core_type ==             core_type ==
+               CPU_CORE                  GCN_CU
+                    │                      │
+              switch_to()           dispatch_to_gcn()
+              (x86 context          (write AQL packet
+               switch)               to HSA queue)
+                    │                      │
+              x86 core runs          GCN CU runs
+              next user thread      wavefront
+```
+
+Scheduling policy:
+- `fork()` without CLONE_GCN → child inherits parent's core type
+- `clone(CLONE_GCN)` → child forced to GCN CU (parent can be CPU or GCN)
+- System-wide load balancer treats GCN CUs as additional "CPUs" in the run queue graph
+- Affinity: `sched_setaffinity()` extended with a core-type bitmask
+- No implicit migration between CPU and GCN unless explicitly requested (different ISA!)
+
+Implicit in this design:
+- CPU threads use normal x86 SYSCALL instruction for syscalls
+- GCN threads use mailbox protocol for syscalls
+- Both paths call the same `do_syscall_64()`
+- hUMA shared memory means CPU and GCN threads share the same virtual address space
+- `mmap()`, shared memory, pipes work identically between CPU and GCN threads
 
 ---
 
@@ -200,15 +242,16 @@ Offset  Size    Field           Description
 | E4 | Port first 5 musl syscall wrappers (write, read, exit, brk, mmap) | Compiles for amdgcn |
 | E5 | `gcn/linker.ld` — linker script for GCN executables | `ld.lld` accepts it |
 
-### Phase F: Scheduler + Thread Model [OFFLINE — 4-6 days]
+### Phase F: Scheduler + Heterogeneous Thread Model [OFFLINE — 4-6 days]
 
 | # | Task | Verification |
 |---|------|-------------|
-| F1 | `include/gcn_thread.h` — `gcn_thread` struct definition | Compiles for x86 |
-| F2 | `kernel/scheduler.c` — FIFO ready queue, run queue per CU | Unit tests pass |
+| F1 | `include/gcn_thread.h` — `core_type` enum, `gcn_context`, mailbox linkage | Compiles for x86 |
+| F2 | `kernel/scheduler.c` — heterogeneous run queues: per-x86-core + per-GCN-CU | Unit tests pass |
 | F3 | `kernel/context.c` — GCN context save/restore (SGPR/VGPR/LDS) | Logic tests pass |
-| F4 | `kernel/dispatch.c` — AQL packet construction + queue submission | Compiles |
-| F5 | Scheduler unit tests with mocked HSA dispatch | `make test_scheduler` passes |
+| F4 | `kernel/dispatch.c` — AQL packet construction + queue submission for GCN threads | Compiles |
+| F5 | `kernel/clone_gcn.c` — hook in `copy_process()`: allocate mailbox, set `core_type=GCN_CU` | Compiles |
+| F6 | Scheduler unit tests with mocked HSA dispatch, both CPU and GCN paths | `make test_scheduler` passes |
 
 ### Phase G: KFD Integration Layer [OFFLINE compile / ONLINE test — 3-4 days]
 
@@ -274,11 +317,12 @@ Offset  Size    Field           Description
 
 ## Key Invariants
 
-1. **No user thread ever executes on x86 cores** — enforced by `__schedule()` dispatch path
-2. **No interrupt ever fires on a GCN CU** — guaranteed by hardware (no IRQ lines)
-3. **All privileged operations happen on x86 in kernel context** — mailbox protocol ensures this
-4. **Unified address space** — hUMA, page tables shared between x86 and GCN
-5. **Syscall path** — GCN → mailbox → x86 poller → `do_syscall_64()` → result → GCN
+1. **No interrupt ever fires on a GCN CU** — guaranteed by hardware (no IRQ lines wired)
+2. **GCN threads communicate with kernel via mailbox** — no SYSCALL instruction available on GCN
+3. **x86 threads use standard SYSCALL instruction** — normal x86 userspace works unchanged
+4. **All privileged operations happen on x86 in kernel context** — both entry paths converge at `do_syscall_64()`
+5. **Unified address space** — hUMA: CPU and GPU share the same page tables and virtual addresses
+6. **Core type is set at clone() time** — `clone(CLONE_GCN)` spawns GCN wavefront; default spawns x86 thread
 
 ## Hard Problems (Ranked)
 
@@ -321,8 +365,10 @@ APUkernel/
 │   ├── kbuild.mk         # Kbuild makefile
 │   ├── heteroken_main.c  # Module init/exit
 │   ├── hsa_queue.c       # HSA queue management via KFD
-│   ├── scheduler.c       # Thread scheduler
+│   ├── scheduler.c       # Heterogeneous thread scheduler (x86 + GCN)
 │   ├── context.c         # GCN context save/restore
+│   ├── clone_gcn.c       # CLONE_GCN hook in copy_process
+│   ├── dispatch.c        # AQL packet dispatch to GCN CU
 │   ├── dispatch.c        # AQL packet dispatch to GCN CU
 │   ├── mailbox_handler.c # Syscall poller (x86 side)
 │   ├── page_fault.c      # GCN page fault handler
@@ -361,3 +407,6 @@ APUkernel/
 | 2026-05-08 | B3 | `gcn/trap_handler.S` — 2 trap handlers, compiles to .hsaco | ✅ |
 | 2026-05-08 | B4-B5 | Build system (Makefile) — .S→.o→.hsaco pipeline works | ✅ |
 | 2026-05-08 | — | GFX7 ISA constraints documented (flat offset, v_add_u32, etc.) | ✅ |
+| 2026-05-08 | — | Build output redirected to `build/`; `.gitignore` created | ✅ |
+| 2026-05-08 | — | HW spec corrected: 4 CPU + 6 GPU (not 8) | ✅ |
+| 2026-05-08 | — | Architecture revised: x86 can also run user threads; heterogeneous scheduling | ✅ |
