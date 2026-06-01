@@ -24,8 +24,8 @@ static unsigned long (*kln)(const char *);
 static void *(*f_cp)(struct task_struct *);
 static void  (*f_ur)(void *);
 static void *(*f_pdd)(void *, uint32_t);
-static int   (*f_ivm)(void *, struct file *);  /* init_vm */
-static void *(*f_bind)(void *, void *);           /* bind_process_to_device */
+static int   (*f_ivm)(void *, struct file *);
+static void *(*f_bind)(void *, void *);
 static int   (*f_pqm)(void *, void *, void *, void *, unsigned int *,
 		      const void *, const void *, const void *, uint32_t *);
 static int   (*f_dqm)(void *, unsigned int);
@@ -33,6 +33,11 @@ static int   (*f_alloc)(void *, uint64_t, uint64_t, void *, void **,
 			uint64_t *, uint32_t, bool);
 static int   (*f_map)(void *, void *, void *);
 static int   (*f_free)(void *, void *, void *, uint64_t *);
+static int   (*f_doorbell)(void *, void *); /* kfd_alloc_process_doorbells */
+static struct file *kfd_file, *drm_file;
+static void *kfd_proc, *ring_mem, *wptr_mem, *rptr_mem;
+static unsigned int qid;
+static bool q_ok;
 
 #define GPU_ID      43858
 #define GPUVA_RING  0x1000000ULL
@@ -44,11 +49,6 @@ static int   (*f_free)(void *, void *, void *, uint64_t *);
 enum { QP_TYPE=0, QP_FORMAT=4, QP_QUEUE_ADDR=16, QP_QUEUE_SIZE=24,
        QP_PRIORITY=32, QP_QUEUE_PERCENT=36, QP_READ_PTR=40, QP_WRITE_PTR=48,
        QP_WPTR_BO=160, QP_RPTR_BO=168, QP_RING_BO=176 };
-
-static struct file *kfd_file, *drm_file;
-static void *kfd_proc, *ring_mem, *wptr_mem, *rptr_mem;
-static unsigned int qid;
-static bool q_ok;
 
 static int resolve(void *name, void **fn)
 {
@@ -110,6 +110,7 @@ static int __init hk_queue_init(void)
 	if (resolve("amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu", (void **)&f_alloc)) return -ENOENT;
 	if (resolve("amdgpu_amdkfd_gpuvm_map_memory_to_gpu", (void **)&f_map)) return -ENOENT;
 	if (resolve("amdgpu_amdkfd_gpuvm_free_memory_of_gpu", (void **)&f_free)) return -ENOENT;
+	if (resolve("kfd_alloc_process_doorbells", (void **)&f_doorbell)) return -ENOENT;
 	pr_info("hk_queue: symbols OK\n");
 
 	/* 1. Open files, create process */
@@ -121,21 +122,27 @@ static int __init hk_queue_init(void)
 	kfd_proc = kfd_file->private_data;
 	pr_info("hk_queue: proc=%px\n", kfd_proc);
 
-	/* 2. Init VM */
+	/* 2. Init VM first (sets drm_priv, required by bind) */
 	void *pdd = f_pdd(kfd_proc, GPU_ID);
 	if (!pdd) { pr_err("pdd\n"); return -EINVAL; }
+
 	ret = f_ivm(pdd, drm_file);
-	if (ret) { pr_err("ivm=%d\n", ret); return ret; }
-	pr_info("hk_queue: VM ready\n");
+	pr_info("hk_queue: init_vm: %d\n", ret);
+	if (ret) return ret;
+
+	/* 3. Bind (requires drm_priv to be set) */
+	void *node = *(void **)pdd;
+	void *pdd_bound = f_bind(node, kfd_proc);
+	if (IS_ERR(pdd_bound)) {
+		pr_err("hk_queue: bind failed: %ld\n", PTR_ERR(pdd_bound));
+		return PTR_ERR(pdd_bound);
+	}
+	pr_info("hk_queue: bind OK, pdd=%px\n", pdd_bound);
 
 	/* Get node + adev + drm_priv from PDD */
-	void *node = *(void **)pdd;
 	void *adev = *(void **)((char *)node + 8);
-	pr_info("hk_queue: node=%px  adev=%px\n", node, adev);
+	pr_info("hk_queue: node=%px adev=%px\n", node, adev);
 
-	/* Bind process to device (required before queue creation) */
-	void *pdd2 = f_bind(node, kfd_proc);
-	pr_info("hk_queue: bind: %px\n", pdd2);
 	void *dpriv = NULL;
 	for (int o = 200; o < 1000; o += 8) {
 		if (*(void **)((char *)pdd + o) == drm_file) {
@@ -153,6 +160,15 @@ static int __init hk_queue_init(void)
 	if (ret) { pr_err("alloc wptr=%d\n", ret); return ret; }
 	ret = f_alloc(adev, GPUVA_RPTR, 4096, dpriv, &rptr_mem, &off, fl, false);
 	if (ret) { pr_err("alloc rptr=%d\n", ret); return ret; }
+
+	/* Also allocate EOP buffer — CIK compute queues require it */
+	void *eop_mem;
+	uint64_t eop_gpuva = 0x1030000ULL;
+	ret = f_alloc(adev, eop_gpuva, 4096, dpriv, &eop_mem, &off, fl, false);
+	if (ret) { pr_err("alloc eop=%d\n", ret); return ret; }
+	ret = f_map(adev, eop_mem, dpriv);
+	if (ret) { pr_err("map eop=%d\n", ret); return ret; }
+	pr_info("hk_queue: EOP alloc+map OK\n");
 	pr_info("hk_queue: alloc OK\n");
 
 	/* 4. Map to GPU VM */
@@ -176,9 +192,13 @@ static int __init hk_queue_init(void)
 	*(uint64_t *)(qp + QP_READ_PTR)     = GPUVA_RPTR;
 	*(uint64_t *)(qp + QP_WRITE_PTR)    = GPUVA_WPTR;
 
+	/* EOP buffer */
 	*(void **)(qp + QP_WPTR_BO) = find_bo(wptr_mem);
 	*(void **)(qp + QP_RPTR_BO) = find_bo(rptr_mem);
 	*(void **)(qp + QP_RING_BO) = find_bo(ring_mem);
+	*(void **)(qp + 184)        = find_bo(eop_mem);  /* eop_buf_bo at offset 184 */
+	*(uint64_t *)(qp + 104)     = eop_gpuva;         /* eop_ring_buffer_address at offset 104 */
+	*(uint32_t *)(qp + 112)     = 4096;               /* eop_ring_buffer_size at offset 112 */
 
 	pr_info("hk_queue: BOs: wptr=%px rptr=%px ring=%px\n",
 		*(void **)(qp + QP_WPTR_BO),
@@ -188,6 +208,16 @@ static int __init hk_queue_init(void)
 	/* 6. Find the REAL pqm (last self-ptr in kfd_process) */
 	void *pqm = find_pqm(kfd_proc);
 	if (!pqm) { pr_err("pqm not found\n"); return -EIO; }
+
+	/* Allocate process doorbells (required before create_queue on CIK) */
+	/* kfd_dev at node+216 (verified from dump: local_mem_info is 16 bytes) */
+	void *kfd_dev = *(void **)((char *)node + 216);
+	pr_info("hk_queue: kfd_dev at node+216 = %px\n", kfd_dev);
+	if (!kfd_dev) { pr_err("kfd_dev is NULL at node+224\n"); return -EIO; }
+
+	ret = f_doorbell(kfd_dev, pdd);
+	pr_info("hk_queue: doorbell alloc: %d\n", ret);
+	if (ret) { pr_err("doorbell failed: %d\n", ret); return ret; }
 
 	/* 7. Create queue */
 	uint32_t db;

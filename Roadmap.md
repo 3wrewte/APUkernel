@@ -418,6 +418,8 @@ APUkernel/
 | 2026-06-01 | D | queue_properties offsets verified on target (offsetof module) | ✅ |
 | 2026-06-01 | D | pqm located at proc+688 via list_head pattern match | ✅ |
 | 2026-06-01 | D | GPU memory alloc+map works from kernel module | ✅ |
-| 2026-06-01 | D | `pqm_create_queue` crashes — likely missing `kfd_bind_process_to_device` | 🔧 |
+| 2026-06-01 | D | `pqm_create_queue` crashes — missing doorbell alloc + wrong kfd_dev offset | 🔧 |
+| 2026-06-01 | D | Full fix: add EOP buffer, doorbell alloc, correct kfd_dev at node+216 | ✅ |
+| 2026-06-01 | H | **QUEUE CREATED on GCN CU!** id=0 via kernel module kallsyms bypass | ✅ |
 | 2026-06-01 | — | GFX7-vs-GFX9 doc written; sticking with Kaveri | ✅ |
 | 2026-06-01 | — | Root cause of create_queue ioctl failure: GFX7 lacks SVM | ✅ |
