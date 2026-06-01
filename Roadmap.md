@@ -410,3 +410,14 @@ APUkernel/
 | 2026-05-08 | — | Build output redirected to `build/`; `.gitignore` created | ✅ |
 | 2026-05-08 | — | HW spec corrected: 4 CPU + 6 GPU (not 8) | ✅ |
 | 2026-05-08 | — | Architecture revised: x86 can also run user threads; heterogeneous scheduling | ✅ |
+| 2026-06-01 | — | Target ready: Debian 13, kernel 6.12.86, amdkfd built-in | ✅ |
+| 2026-06-01 | G | rocminfo: 6 CUs / gfx700 / hUMA pools all visible | ✅ |
+| 2026-06-01 | G | libhsakmt + HSA runtime installed; hsaKmtAllocMemory works | ✅ |
+| 2026-06-01 | G | GPU VA allocation+MAP confirmed working (userspace + kallsyms) | ✅ |
+| 2026-06-01 | D | Kernel module: 9 KFD internal symbols resolved via kallsyms | ✅ |
+| 2026-06-01 | D | queue_properties offsets verified on target (offsetof module) | ✅ |
+| 2026-06-01 | D | pqm located at proc+688 via list_head pattern match | ✅ |
+| 2026-06-01 | D | GPU memory alloc+map works from kernel module | ✅ |
+| 2026-06-01 | D | `pqm_create_queue` crashes — likely missing `kfd_bind_process_to_device` | 🔧 |
+| 2026-06-01 | — | GFX7-vs-GFX9 doc written; sticking with Kaveri | ✅ |
+| 2026-06-01 | — | Root cause of create_queue ioctl failure: GFX7 lacks SVM | ✅ |
