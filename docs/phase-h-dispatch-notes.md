@@ -148,3 +148,54 @@ filp_open("/dev/kfd") → kfd_create_process
 3. Build an Indirect Buffer (IB) with shader setup + dispatch
 4. Write INDIRECT_BUFFER PM4 packet to ring buffer
 5. Verify magic value appears in result buffer
+
+## Attempts at Direct / IB-based Shader Loading
+
+### Attempt 4: SET_SH_REG directly in ring buffer
+
+Wrote `PACKET3_SET_SH_REG(5)` (0x76) + `PACKET3_SET_SH_REG(1)` + `DISPATCH_DIRECT(4)`
+directly to the ring buffer. The CP processed the packets (wptr advanced),
+but the kernel did not execute. SET_SH_REG is likely a privileged packet
+rejected by the CP for user-mode compute queues.
+
+### Attempt 5: INDIRECT_BUFFER with SET_SH_REG in IB
+
+Built an IB (16 dwords) containing SET_SH_REG to set compute registers
+followed by DISPATCH_DIRECT. Submitted `PACKET3_INDIRECT_BUFFER(2)` (0x3F)
+to the ring. Result: kernel still did not execute. The CP either rejected
+the INDIRECT_BUFFER or executed the IB but the SET_SH_REG commands were
+silently ignored.
+
+### Attempt 6: pqm_update_mqd flush
+
+Called KFD's `pqm_update_mqd` after manual MQD register writes. Returned
+-EACCES (-13), suggesting the queue manager requires a lock or the update
+is not permitted in the current queue state.
+
+## Conclusion: CIK Dispatch Limitation
+
+On CIK (GFX7), user-mode compute queues managed by KFD do NOT support
+arbitrary PM4 shader configuration through any of these mechanisms:
+- MQD register writes (CP ignores compute_pgm)
+- PACKET3_SET_SH_REG (likely privileged)
+- INDIRECT_BUFFER with SET_SH_REG (rejected or ignored)
+
+The CP firmware on CIK was designed before AQL (introduced in GFX8/MEC).
+The dispatch path for user compute kernels goes through a higher-level
+mechanism (HSA AQL dispatch) that is emulated by the KFD driver.
+
+## Recommended Path Forward
+
+For Phase H completion, use the **HSA runtime's dispatch path** (which
+we know works on this hardware — rocminfo confirms GFX7 support):
+
+1. Use `libhsakmt` + `hsaKmtCreateQueue` + HSA AQL dispatch packets
+   to dispatch `hello_gcn.hsaco` from userspace
+2. This validates the end-to-end "GCN executes and writes to hUMA" milestone
+3. The kernel module path (for production HeteroKern architecture) will then
+   implement dispatch through the KFD's internal HSA AQL handling, which is
+   well-tested and known to work
+
+The entire kernel module infrastructure we built (queue creation, GPU memory
+allocation, GPU VM mapping) remains essential — only the dispatch mechanism
+changes from raw PM4 to HSA AQL.

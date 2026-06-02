@@ -38,6 +38,7 @@ FPTR(int,    db, void *, void *);
 FPTR(void *, gpq, void *, unsigned int);
 FPTR(void *, bokptr, void *);
 FPTR(int,    bokmap, void *, void **);
+FPTR(int,    upmqd,  void *, unsigned int, void *);
 #undef FPTR
 
 #define GPU_ID      43858
@@ -48,7 +49,14 @@ FPTR(int,    bokmap, void *, void **);
 #define GPUVA_KERN  0x1040000ULL   /* kernel code buffer */
 #define GPUVA_RESULT 0x1050000ULL   /* result buffer for magic value */
 #define GPUVA_ARGS   0x1060000ULL   /* kernel args buffer */
+#define GPUVA_IB     0x1070000ULL   /* indirect buffer for shader setup */
 #define RING_BYTES  (32ULL * 1024)
+
+/* CIK PM4 packet helpers */
+#define PACKET3(op, n)  ((0xC0000000U) | ((n) << 16) | ((op) << 8))
+#define PACKET3_SET_SH_REG      0x76
+#define PACKET3_SET_SH_REG_START 0x00002c00
+#define PACKET3_DISPATCH_DIRECT 0x15
 
 enum { QP_TYPE=0, QP_FORMAT=4, QP_QUEUE_ADDR=16, QP_QUEUE_SIZE=24,
        QP_PRIORITY=32, QP_QUEUE_PERCENT=36, QP_READ_PTR=40, QP_WRITE_PTR=48,
@@ -57,7 +65,7 @@ enum { QP_TYPE=0, QP_FORMAT=4, QP_QUEUE_ADDR=16, QP_QUEUE_SIZE=24,
 /* ── State ── */
 static struct file *kfd_file, *drm_file;
 static void *kfd_proc, *ring_mem, *wptr_mem, *rptr_mem, *eop_mem;
-static void *kern_mem, *result_mem, *args_mem;
+static void *kern_mem, *result_mem, *args_mem, *ib_mem;
 static unsigned int qid;
 static bool q_ok;
 /* R(short, "full_symbol_name") */
@@ -169,6 +177,7 @@ static int __init hk_queue_init(void)
 	R(db,     "kfd_alloc_process_doorbells");
 	R(bokptr, "amdgpu_bo_kptr");
 	R(bokmap, "amdgpu_bo_kmap");
+	R(upmqd,  "pqm_update_mqd");
 
 	/* 1. Open files, create process */
 	kfd_file = filp_open("/dev/kfd", O_RDWR | O_CLOEXEC, 0);
@@ -203,6 +212,7 @@ static int __init hk_queue_init(void)
 	{ uint64_t va = GPUVA_KERN;  fl |= KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE; ret = f_alloc(adev, va, 4096, dpriv, &kern_mem, &off, fl, false); fl &= ~KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE; if (ret) return ret; ret = f_map(adev, kern_mem, dpriv); if (ret) return ret; }
 	{ uint64_t va = GPUVA_RESULT; ret = f_alloc(adev, va, 4096, dpriv, &result_mem, &off, fl, false); if (ret) return ret; ret = f_map(adev, result_mem, dpriv); if (ret) return ret; }
 	{ uint64_t va = GPUVA_ARGS;   ret = f_alloc(adev, va, 4096, dpriv, &args_mem,   &off, fl, false); if (ret) return ret; ret = f_map(adev, args_mem,   dpriv); if (ret) return ret; }
+	{ uint64_t va = GPUVA_IB;     ret = f_alloc(adev, va, 4096, dpriv, &ib_mem,     &off, fl, false); if (ret) return ret; ret = f_map(adev, ib_mem,     dpriv); if (ret) return ret; }
 	pr_info("hk_queue: all buffers allocated\n");
 
 	/* 4. Build queue_properties */
@@ -291,57 +301,90 @@ static int __init hk_queue_init(void)
 
 	pr_info("hk_queue: MQD updated (dispatch_initiator=0x%x)\n", mqd[1]);
 
-	/* 9. Get ring buffer CPU mapping + submit DISPATCH_DIRECT */
+	/* Flush MQD to GPU via KFD's update_mqd */
+	ret = f_upmqd(pqm, qid, NULL);
+	pr_info("hk_queue: pqm_update_mqd: %d\n", ret);
+
+	/* 9. Build Indirect Buffer (IB) + submit INDIRECT_BUFFER to ring */
 	{
+		void *ib_bo = find_bo(ib_mem), *ib_cpu;
+		ret = f_bokmap(ib_bo, &ib_cpu);
+		if (ret) { pr_err("hk_queue: ib kmap failed: %d\n", ret); return ret; }
+
+		uint32_t pgm_lo = (GPUVA_KERN >> 8) & 0xFFFFFFFF;
+		uint32_t pgm_hi = (GPUVA_KERN >> 40) & 0xFF;
+		uint32_t udata_lo = GPUVA_ARGS & 0xFFFFFFFF;
+		uint32_t udata_hi = (GPUVA_ARGS >> 32) & 0xFFFFFFFF;
+
+		uint32_t *ib = (uint32_t *)ib_cpu;
+		int ib_idx = 0;
+
+		/* SET_SH_REG(5): COMPUTE_PGM_LO through COMPUTE_USER_DATA_1 */
+		ib[ib_idx++] = PACKET3(PACKET3_SET_SH_REG, 5);
+		ib[ib_idx++] = 0x2E0C - PACKET3_SET_SH_REG_START;
+		ib[ib_idx++] = pgm_lo;
+		ib[ib_idx++] = pgm_hi;
+		ib[ib_idx++] = hello_gcn_rsrc1;
+		ib[ib_idx++] = hello_gcn_rsrc2;
+		ib[ib_idx++] = udata_lo;
+		ib[ib_idx++] = udata_hi;
+
+		/* SET_SH_REG(1): COMPUTE_DISPATCH_INITIATOR */
+		ib[ib_idx++] = PACKET3(PACKET3_SET_SH_REG, 1);
+		ib[ib_idx++] = 0x2E04 - PACKET3_SET_SH_REG_START;
+		ib[ib_idx++] = (1 << 0) | (1 << 2);
+
+		/* DISPATCH_DIRECT */
+		ib[ib_idx++] = PACKET3(PACKET3_DISPATCH_DIRECT, 4);
+		ib[ib_idx++] = 1 | (1 << 16);  /* dim_xy */
+		ib[ib_idx++] = 1;              /* dim_z */
+		ib[ib_idx++] = (1 << 0) | (1 << 2);  /* dispatch_initiator */
+		ib[ib_idx++] = 0;              /* reserved */
+
+		uint32_t ib_dw = ib_idx;
+		pr_info("hk_queue: IB built: %u dwords at GPUVA 0x%llx\n",
+			ib_dw, (unsigned long long)GPUVA_IB);
+
+		/* Write INDIRECT_BUFFER to ring buffer */
 		void *ring_bo = find_bo(ring_mem), *ring_cpu_raw;
 		void *wptr_bo = find_bo(wptr_mem), *wptr_cpu_raw;
-
 		ret = f_bokmap(ring_bo, &ring_cpu_raw);
-		if (ret) { pr_err("hk_queue: ring kmap failed: %d\n", ret); return ret; }
+		if (ret) return ret;
 		ret = f_bokmap(wptr_bo, &wptr_cpu_raw);
-		if (ret) { pr_err("hk_queue: wptr kmap failed: %d\n", ret); return ret; }
+		if (ret) return ret;
 
 		uint32_t *ring_cpu = ring_cpu_raw;
 		uint32_t *wptr_cpu = wptr_cpu_raw;
-		uint32_t wptr = *wptr_cpu;
-		uint32_t idx = (wptr / 4) % (RING_BYTES / 4);
+		uint32_t wptr_val = *wptr_cpu;
+		uint32_t ridx = (wptr_val / 4) % (RING_BYTES / 4);
 
-		/* PM4 DISPATCH_DIRECT: type3, count=4, opcode=0x15 */
-		ring_cpu[idx + 0] = 0xc0000000U | (4 << 16) | (0x15 << 8);
-		/* dim_x, dim_y, dim_z (1 work-item = 1 wavefront) */
-		ring_cpu[idx + 1] = 1;
-		ring_cpu[idx + 2] = 1;
-		ring_cpu[idx + 3] = 1;
-		/* dispatch_initiator: COMPUTE_SHADER_EN(1) | FORCE_START_AT_000(4) */
-		ring_cpu[idx + 4] = (1 << 0) | (1 << 2);
-		/* reserved */
-		ring_cpu[idx + 5] = 0;
-		ring_cpu[idx + 6] = 0;
-		ring_cpu[idx + 7] = 0;
-		/* completion signal (0 = sync) */
-		ring_cpu[idx + 8] = 0;
+		/* INDIRECT_BUFFER packet (count=2, 3 data dwords) */
+		ring_cpu[ridx + 0] = PACKET3(0x3F, 2);  /* IT_INDIRECT_BUFFER */
+		ring_cpu[ridx + 1] = GPUVA_IB & 0xFFFFFFFC;
+		ring_cpu[ridx + 2] = (GPUVA_IB >> 32) & 0xFFFF;
+		ring_cpu[ridx + 3] = ib_dw;  /* length in dwords */
 
-		/* Advance write pointer (9 dwords) */
-		wptr += 9 * 4;
-		*wptr_cpu = wptr;
+		/* Advance wptr (4 dwords) */
+		wptr_val += 4 * 4;
+		*wptr_cpu = wptr_val;
 
-		/* Ring doorbell: try bo_kptr, skip if NULL */
+		/* Ring doorbell */
 		int db_rung = 0;
 		void *doorbell_bo = *(void **)((char *)pdd + 176);
 		if (doorbell_bo) {
 			void *db_cpu = f_bokptr(doorbell_bo);
 			if (db_cpu && q) {
-				uint32_t doorbell_id = *(uint32_t *)((char *)q + 260);
-				*(uint32_t *)((uint32_t *)db_cpu + doorbell_id) = wptr;
-				pr_info("hk_queue: doorbell RUNG via bo_kptr id=%u val=0x%x\n",
-					doorbell_id, wptr);
+				uint32_t db_id = *(uint32_t *)((char *)q + 260);
+				*(uint32_t *)((uint32_t *)db_cpu + db_id) = wptr_val;
+				pr_info("hk_queue: doorbell RUNG id=%u val=0x%x\n",
+					db_id, wptr_val);
 				db_rung = 1;
 			}
 		}
-		/* TODO: fallback via adev->doorbell.cpu_addr when offset is known */
 		if (!db_rung)
-			pr_info("hk_queue: doorbell skipped (no CPU mapping yet)\n");
-		pr_info("hk_queue: DISPATCH_DIRECT submitted, wptr=0x%x\n", wptr);
+			pr_info("hk_queue: doorbell skipped\n");
+
+		pr_info("hk_queue: INDIRECT_BUFFER submitted, wptr=0x%x\n", wptr_val);
 	}
 
 	/* 10. Wait and verify result */

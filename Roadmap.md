@@ -442,4 +442,8 @@ APUkernel/
 | 2026-06-01 | H | Doorbell rung (bo_kptr, intermittent: works 50% of boots) | ✅ |
 | 2026-06-01 | H | **GCN execution blocked**: CIK MQD shader regs unused; need INDIRECT_BUFFER | 🔧 |
 | 2026-06-01 | H | Hand-coded GCN bytes replaced with actual .hsaco extraction (bug fix) | ✅ |
-| 2026-06-01 | — | docs/phase-h-dispatch-notes.md: dispatch debugging log | ✅ |
+| 2026-06-01 | H | SET_SH_REG direct on ring: CP ignores (likely privileged packet) | 🔧 |
+| 2026-06-01 | H | INDIRECT_BUFFER(0x3F) with IB: rejected or ignored by CP | 🔧 |
+| 2026-06-01 | H | pqm_update_mqd returns -EACCES | 🔧 |
+| 2026-06-01 | H | **CIK conclusion**: user queues can't set shader via PM4; need HSA AQL dispatch | 🔧 |
+| 2026-06-01 | — | docs/phase-h-dispatch-notes.md: dispatch debugging log updated | ✅ |
