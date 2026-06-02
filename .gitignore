@@ -30,6 +30,7 @@ initramfs/
 \#*\#
 
 # Misc
+scripts/
 *.tmp
 *.log
 .cache/

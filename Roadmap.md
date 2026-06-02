@@ -446,4 +446,8 @@ APUkernel/
 | 2026-06-01 | H | INDIRECT_BUFFER(0x3F) with IB: rejected or ignored by CP | 🔧 |
 | 2026-06-01 | H | pqm_update_mqd returns -EACCES | 🔧 |
 | 2026-06-01 | H | **CIK conclusion**: user queues can't set shader via PM4; need HSA AQL dispatch | 🔧 |
+| 2026-06-02 | H | AQL queue format (QP_FORMAT=1) + AQL dispatch packet: no execution | 🔧 |
+| 2026-06-02 | — | docs/why-offsets.md: why we guess struct offsets | ✅ |
+| 2026-06-02 | — | scripts/: deploy-test.sh, reboot.sh, cycle.sh, build-gcn.sh, hw-check.sh | ✅ |
+| 2026-06-02 | H | Doorbell: bo_kptr intermittent; ioremap crashed; need proper adev->doorbell path | 🔧 |
 | 2026-06-01 | — | docs/phase-h-dispatch-notes.md: dispatch debugging log updated | ✅ |

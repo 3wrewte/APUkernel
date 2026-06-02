@@ -93,61 +93,63 @@ All struct field accesses must use:
 
 ### 6. MQD shader registers are NOT used by CP on CIK (ROOT CAUSE)
 
-Even with correct MQD register values (`compute_pgm_lo/hi`, `rsrc1/2`,
-`user_data`), the GCN kernel did not execute.
+... [see above] ...
 
-**Root cause**: `kfd_mqd_manager_cik.c` never sets `compute_pgm_lo/hi` in
-`init_mqd` or `__update_mqd`. These registers remain 0 (from `memset`).
-The KFD driver does not configure the shader program through the MQD on CIK.
+### 7. doorbell bo_kptr intermittent
 
-On CIK, the CP reads the shader from the MQD when processing a
-`DISPATCH_DIRECT` packet. Since the MQD's shader pointer is 0, the CP
-fetches instructions from GPU address 0, which contains:
-```
-0x0000: NOP (0x00000000 = s_nop)
-0x0004: s_endpgm (0xBF810000? No — actually address 0 is typically zeros)
-```
-The "shader" at address 0 either does nothing or causes a GPU fault.
+`amdgpu_bo_kptr(proc_doorbells_bo)` returns a valid pointer on roughly
+50% of boots and NULL on the other 50%. The doorbell BO is allocated with
+`KFD_IOC_ALLOC_MEM_FLAGS_DOORBELL`, which creates an MMIO-backed BO.
+Whether `bo_kptr` returns a valid pointer depends on whether the BO
+happens to have a CPU mapping at the time of the call (possibly set
+by a prior GPU operation or the display driver).
 
-**Required fix**: Instead of writing `DISPATCH_DIRECT` directly, the
-dispatch must use `PACKET3_INDIRECT_BUFFER` + a GPU buffer (IB) containing:
-1. `SET_SH_REG` packets to configure compute shader registers
-2. `DISPATCH_DIRECT` to launch
+### 8. ioremap of doorbell physical base crashes
 
-This requires:
-- CIK register addresses for `COMPUTE_PGM_LO/HI`, `COMPUTE_PGM_RSRC1/2`,
-  `COMPUTE_USER_DATA_0-1`, and `COMPUTE_DISPATCH_INITIATOR`
-- `PACKET3_SET_SH_REG` packet format
-- Knowledge of `PACKET3_INDIRECT_BUFFER` format for CIK compute queues
+We found `adev->doorbell.base` at adev+2288 = `0xfeb00000` by scanning
+for an MMIO-range physical address. Attempting `ioremap(0xfeb00000, 0x40000)`
+and `writel()` to it caused a segfault (SIGSEGV). The MMIO region at that
+address may not be accessible, or the doorbell CPU mapping requires
+additional setup (PCIe BAR configuration) already done by amdgpu.
 
-## Working: Complete Infrastructure
+### 9. AQL dispatch packet + AQL queue format (QP_FORMAT=1)
 
-Despite the GCN execution block, the entire infrastructure pipeline works:
+Changed queue format from PM4 (0) to AQL (1) and wrote an HSA AQL
+`hsa_kernel_dispatch_packet_t` (64 bytes) to the ring buffer. Result:
+kernel did not execute. Without the doorbell ringing, the CP doesn't
+know about the new work. And even with the doorbell, the AQL packet
+may require the `kernel_object` field to point to a full
+`amd_kernel_code_t` descriptor (not raw GCN code), which we didn't
+construct.
 
-```
-filp_open("/dev/kfd") → kfd_create_process
-  → kfd_process_device_data_by_id
-  → kfd_process_device_init_vm
-  → kfd_bind_process_to_device
-  → amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu × 7 (ring/wptr/rptr/eop/kern/result/args)
-  → amdgpu_amdkfd_gpuvm_map_memory_to_gpu × 7
-  → Build queue_properties (verified offsets)
-  → kfd_alloc_process_doorbells
-  → pqm_create_queue → QUEUE id=0
-  → bo_kmap(ring_cpu) + bo_kmap(wptr_cpu)
-  → Write PM4 DISPATCH_DIRECT to ring buffer
-  → Update MQD registers (correct offsets, verified)
-  → amdgpu_bo_kptr(doorbell_bo) → ring doorbell
-  → RC=0, module loads cleanly
-```
+## Status Summary
 
-## Next Steps
+### What Works
 
-1. Research `PACKET3_INDIRECT_BUFFER` and `PACKET3_SET_SH_REG` for CIK
-2. Find CIK register addresses for compute shader configuration
-3. Build an Indirect Buffer (IB) with shader setup + dispatch
-4. Write INDIRECT_BUFFER PM4 packet to ring buffer
-5. Verify magic value appears in result buffer
+- Queue creation (via kallsyms + KFD internals)  
+- GPU memory allocation + GPU VM mapping (via KFD gpuvm functions)
+- MQD register updates (verified offsets, confirmed by KFD behavior)
+- Ring buffer CPU mapping + packet writing (via amdgpu_bo_kmap)
+- Kernel code loading into GPU memory
+- Doorbell BO location (PDD+176, always found)
+- Doorbell ringing (when bo_kptr returns non-NULL, works correctly)
+
+### What's Blocked
+
+- **Reliable doorbell CPU mapping** — need `adev->doorbell.cpu_addr` offset
+  or `amdgpu_doorbell_index_on_bar`-equivalent access. See `docs/why-offsets.md`.
+- **Correct CIK dispatch packet** — may need full `amd_kernel_code_t`
+  descriptor + AQL packet, or may need a different dispatch mechanism.
+
+### Path to Unblock
+
+1. Find `adev->doorbell.cpu_addr` offset using `pahole` or kernel debuginfo:
+   ```bash
+   pahole -C amdgpu_device /usr/lib/debug/boot/vmlinux-$(uname -r)
+   ```
+2. OR: switch to approach A (in-tree build). Then `adev->doorbell.cpu_addr`
+   just works.
+3. Or: use ROCr/HSA runtime for the dispatch layer (proven CIK support).
 
 ## Attempts at Direct / IB-based Shader Loading
 
