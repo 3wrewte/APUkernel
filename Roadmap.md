@@ -268,10 +268,20 @@ Offset  Size    Field           Description
 | # | Task | Verification |
 |---|------|-------------|
 | H1 | Deploy kernel + module + GCN binary to A8-7500 | Boots, amdkfd loads |
-| H2 | `test_mailbox_gcn.S` — GCN writes to shared memory, signals x86 | x86 reads correct value from hUMA |
-| H3 | `test_dispatch.c` — x86 kernel dispatches GCN kernel, waits for result | Full round-trip works |
-| H4 | GCN `write(1, "hello\n", 6)` via mailbox → x86 handles syscall → UART output | "hello" appears on serial console |
-| H5 | GCN `exit(0)` via mailbox — clean termination | Process exits cleanly, resources freed |
+| H2 | Create compute queue via kallsyms bypass kernel module | Queue created with id=0, db_off=0 |
+| H3 | Load GCN kernel code into GPU memory + update MQD | Code loaded, MQD registers set |
+| H4 | Submit PM4 DISPATCH_DIRECT + ring doorbell | Doorbell rung, packet written |
+| H5 | GCN kernel executes and writes magic value to hUMA | **BLOCKED**: CIK needs INDIRECT_BUFFER to load shader (MQD shader regs not used by CP) |
+| H6 | x86 reads magic value from shared memory → Phase H complete | pending |
+
+**H5 block detail**: CIK compute queues do not use the MQD's `compute_pgm_lo/hi`
+registers for shader dispatch.  KFD never sets these registers (verified in
+`kfd_mqd_manager_cik.c`).  The CP interprets DISPATCH_DIRECT by reading the
+shader from the MQD, but the MQD defaults to 0.  Correct dispatch requires
+`PACKET3_INDIRECT_BUFFER` → SET_SH_REG (configure shader) → DISPATCH_DIRECT.
+
+Next research: CIK INDIRECT_BUFFER packet format + shader register addresses.
+See `docs/phase-h-dispatch-notes.md`.
 
 ### Phase I: Full Syscall Set [ONLINE — 4-6 days]
 
@@ -423,3 +433,13 @@ APUkernel/
 | 2026-06-01 | H | **QUEUE CREATED on GCN CU!** id=0 via kernel module kallsyms bypass | ✅ |
 | 2026-06-01 | — | GFX7-vs-GFX9 doc written; sticking with Kaveri | ✅ |
 | 2026-06-01 | — | Root cause of create_queue ioctl failure: GFX7 lacks SVM | ✅ |
+| 2026-06-01 | — | docs/kernel-hack-notes.md: why kallsyms bypass was needed | ✅ |
+| 2026-06-01 | — | docs/kernel-patch-plan.md: plan to fix KFD ioctl for GFX7 | ✅ |
+| 2026-06-01 | H | Kernel code loaded into GPU memory via bo_kmap | ✅ |
+| 2026-06-01 | H | Args buffer allocated + populated with target address | ✅ |
+| 2026-06-01 | H | MQD updated: compute_pgm, rsrc1/2, user_data, dispatch_initiator | ✅ |
+| 2026-06-01 | H | PM4 DISPATCH_DIRECT written to ring buffer | ✅ |
+| 2026-06-01 | H | Doorbell rung (bo_kptr, intermittent: works 50% of boots) | ✅ |
+| 2026-06-01 | H | **GCN execution blocked**: CIK MQD shader regs unused; need INDIRECT_BUFFER | 🔧 |
+| 2026-06-01 | H | Hand-coded GCN bytes replaced with actual .hsaco extraction (bug fix) | ✅ |
+| 2026-06-01 | — | docs/phase-h-dispatch-notes.md: dispatch debugging log | ✅ |
