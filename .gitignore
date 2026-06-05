@@ -1,8 +1,12 @@
 # Build artifacts
 build/
 
-# Linux kernel source tree
+# Linux kernel source tree (both clean and patched copies)
+kernel-deb/
+kernel-deb-clean/
 kernel-src/
+kernel-deb/
+kernel-deb-clean/
 
 # Kernel module Kbuild intermediates (built in-place in kernel/)
 kernel/*.o
@@ -11,6 +15,12 @@ kernel/*.mod.c
 kernel/*.ko
 kernel/Module.symvers
 kernel/modules.order
+
+#PXE
+pxe/
+
+# Docs
+docs/PXE.md
 
 # Root filesystem build staging (not the build scripts)
 rootfs-staging/
@@ -30,6 +40,7 @@ initramfs/
 \#*\#
 
 # Misc
+tmp/
 scripts/
 *.tmp
 *.log

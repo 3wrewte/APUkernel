@@ -371,19 +371,21 @@ APUkernel/
 │   ├── gcnsyscall.h      # GCN_SYSCALL macros
 │   ├── linker.ld         # GCN executable linker script
 │   └── libc/             # Ported musl source files
-├── kernel/               # x86 Linux kernel module
-│   ├── kbuild.mk         # Kbuild makefile
-│   ├── heteroken_main.c  # Module init/exit
-│   ├── hsa_queue.c       # HSA queue management via KFD
-│   ├── scheduler.c       # Heterogeneous thread scheduler (x86 + GCN)
-│   ├── context.c         # GCN context save/restore
-│   ├── clone_gcn.c       # CLONE_GCN hook in copy_process
-│   ├── dispatch.c        # AQL packet dispatch to GCN CU
-│   ├── dispatch.c        # AQL packet dispatch to GCN CU
-│   ├── mailbox_handler.c # Syscall poller (x86 side)
-│   ├── page_fault.c      # GCN page fault handler
-│   ├── procfs.c          # /proc/heteroken interface
-│   └── aql.c             # AQL packet construction helpers
+├── kernel/               # x86 Linux kernel module [DEPRECATED — moved in-tree]
+│   ├── hk_queue.c         # Phase H: external module (kallsyms bypass, OBSOLETE)
+│   ├── heteroken.c        # Phase H: in-tree kernel module (SYMLINK → kernel-patches/)
+│   └── kbuild.mk          # Kbuild for external module
+├── kernel-patches/        # Kernel modifications (managed by git)
+│   ├── heteroken.c        # In-tree KFD module: create queue + dispatch
+│   └── amdkfd-makefile.patch  # Adds heteroken.o to AMDKFD_FILES
+├── scripts/               # Automation (not tracked by git — contains credentials)
+│   ├── deploy-test.sh     # SCP → build → insmod (old out-of-tree path)
+│   ├── reboot.sh          # sysrq reboot + wait for SSH
+│   ├── cycle.sh           # reboot → deploy → test loop
+│   ├── build-gcn.sh       # Compile gcn/*.S → .hsaco
+│   ├── kernel-test.sh     # Rebuild + deploy + reboot + trigger sysfs test
+│   ├── apply-kernel-patch.sh  # Apply heteroken changes to clean kernel tree
+│   └── build-kernel.sh    # Build kernel + deploy bzImage to PXE
 ├── tests/                # Unit/integration tests (x86 host)
 │   ├── test_mailbox.c    # Mailbox protocol unit tests
 │   ├── test_scheduler.c  # Scheduler logic tests
@@ -449,5 +451,13 @@ APUkernel/
 | 2026-06-02 | H | AQL queue format (QP_FORMAT=1) + AQL dispatch packet: no execution | 🔧 |
 | 2026-06-02 | — | docs/why-offsets.md: why we guess struct offsets | ✅ |
 | 2026-06-02 | — | scripts/: deploy-test.sh, reboot.sh, cycle.sh, build-gcn.sh, hw-check.sh | ✅ |
-| 2026-06-02 | H | Doorbell: bo_kptr intermittent; ioremap crashed; need proper adev->doorbell path | 🔧 |
-| 2026-06-01 | — | docs/phase-h-dispatch-notes.md: dispatch debugging log updated | ✅ |
+| 2026-06-05 | — | Development migrated to EPYC 7502 workstation (64 threads, openSUSE) | ✅ |
+| 2026-06-05 | — | PXE+routing configured; A8-7500 at 192.168.2.170 | ✅ |
+| 2026-06-05 | — | Kernel 6.12.86+deb13 source extracted; heteroken.c moved in-tree | ✅ |
+| 2026-06-05 | — | All kallsyms/offset-guessing removed: direct pdd/q/node access | ✅ |
+| 2026-06-05 | H | Doorbell: adev->doorbell.cpu_addr — always works | ✅ |
+| 2026-06-05 | H | sysfs /sys/kernel/heteroken/run trigger — no boot blocking | ✅ |
+| 2026-06-05 | H | Full pipeline works: process→VM→bind→alloc×7→queue→MQD→descriptor→dispatch | ✅ |
+| 2026-06-05 | H | AQL dispatch: doorbell rings, ring processed, kernel doesn't execute (CIK descriptor issue) | 🔧 |
+| 2026-06-05 | — | kernel-patches/: git-tracked heteroken.c + amdkfd-makefile.patch | ✅ |
+| 2026-06-05 | — | scripts/: apply-kernel-patch.sh, build-kernel.sh, kernel-test.sh | ✅ |

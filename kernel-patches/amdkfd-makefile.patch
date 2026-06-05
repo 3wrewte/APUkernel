@@ -1,0 +1,12 @@
+--- kernel-deb-clean/drivers/gpu/drm/amd/amdkfd/Makefile	2026-05-07 12:09:48.000000000 +0800
++++ kernel-deb/drivers/gpu/drm/amd/amdkfd/Makefile	2026-06-05 18:07:50.936455829 +0800
+@@ -59,7 +59,8 @@
+ 		$(AMDKFD_PATH)/kfd_int_process_v11.o \
+ 		$(AMDKFD_PATH)/kfd_smi_events.o \
+ 		$(AMDKFD_PATH)/kfd_crat.o \
+-		$(AMDKFD_PATH)/kfd_debug.o
++		$(AMDKFD_PATH)/kfd_debug.o \
++		$(AMDKFD_PATH)/heteroken.o
+ 
+ ifneq ($(CONFIG_DEBUG_FS),)
+ AMDKFD_FILES += $(AMDKFD_PATH)/kfd_debugfs.o
