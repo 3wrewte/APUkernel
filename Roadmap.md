@@ -2,14 +2,23 @@
 
 ## Project Goal
 
-Transform AMD A8-7500 APU into a heterogeneous system where:
-- **x86 Steamroller cores** (4×) run the Linux kernel (Ring 0) **and optionally user threads**
-- **GCN Compute Units** (6× Radeon R7) run user threads as wavefronts,
-  with zero-interrupt execution and native SIMD throughput
-- Threads can be spawned on either core type via `clone(CLONE_GCN)`;
-  CPU threads can fork GCN children and vice versa, transparent to the application
-- GCN vector units are treated like a wider SIMD unit (AVX-like), not an offload device
-- Write normal C / pthread code; the scheduler distributes work across CPU and GPU cores
+Transform AMD Ryzen 3 2200G (Raven Ridge) APU into a heterogeneous system where
+a GCN task is a **real Linux task_struct** — created by `clone3(CLONE_GCN)`,
+with a normal CoW address space — whose execution happens on a GPU wavefront.
+The kernel's core scheduler, syscall handlers, and fault handlers remain
+**unmodified**; only the dispatch and communication path is new.
+
+- A GCN task is a `task_struct` with a GPU wavefront as its execution context
+- `clone3(CLONE_GCN + GCN entry descriptor)` → `copy_process()` builds mm with
+  normal CoW → the task arms a per-task mailbox + HSA signal, dispatches one
+  AQL packet (its wavefront), and sleeps on the CPU runqueue
+- Mailbox doorbell → IH interrupt → `wake_up_process()` → the task executes
+  `do_syscall_64()` **as itself** on the CPU → writes result → wave resumes
+- Signals preempt via CWSR queue unmap (GFX9), execute handlers on the shadow
+  context
+- Faults flow through IOMMUv2 PPR / retry faults into `handle_mm_fault()` on
+  the task's mm
+- CPU threads use normal `SYSCALL` — zero kernel changes for the x86 path
 
 ---
 
@@ -17,31 +26,28 @@ Transform AMD A8-7500 APU into a heterogeneous system where:
 
 | Component | Detail |
 |-----------|--------|
-| ~~APU~~ | ~~AMD A8-7500 (Kaveri, FM2+)~~ — **RETIRED** (CIK lacks MEC firmware) |
-| Next APU | AMD Raven Ridge / Picasso / Renoir (GFX9+, Vega, AM4) |
-| CPU cores | 4x x86 (Zen/Zen+) |
-| GPU cores | 8-11 CUs (Vega, GFX9) |
-| Key features | SVM (Shared Virtual Memory), MEC (AQL dispatch), XNACK, full ROCm |
-| Memory model | hUMA — single unified physical address space |
-| Kernel driver | amdkfd (upstream Linux 6.x) |
+| APU | AMD Ryzen 3 2200G (Raven Ridge, AM4) |
+| CPU | 4× Zen @ 3.5/3.7 GHz |
+| GPU | 8× GCN 5.0 CUs (Vega 8, gfx902, 512 shaders) |
+| Memory | DDR4, SVM — single unified virtual address space |
+| GPU features | MEC (AQL dispatch), CWSR (wave preemption), XNACK, IOMMUv2 PPR |
 
-**Migration rationale**: GFX7 (CIK) cannot dispatch user shaders to user-mode
-compute queues — the CP firmware lacks MEC, and KFD does not set `compute_pgm`
-in the MQD. GFX9+ has MEC firmware that natively handles AQL dispatch.
-See `docs/cik-lessons.md` for full analysis. The entire kernel module
-infrastructure (queue creation, GPU memory, doorbell) ports directly to GFX9+
-with minimal changes.
+### Why 2200G (GFX9) instead of A8-7500 (GFX7)
 
-### Original Target (Retained for reference)
+GFX7 (CIK / Kaveri) cannot dispatch user shaders through user-mode compute
+queues — the CP firmware lacks MEC, and PM4 privileged packets are silently
+dropped on user queues. After ~150 test iterations, we concluded this is an
+architectural limitation, not a bug. See `docs/cik-lessons.md`.
 
-| Component | Detail |
-|-----------|--------|
-| APU | AMD A8-7500 (Kaveri, FM2+) |
-| CPU cores | 4x x86 Steamroller |
-| GPU cores | 6x GCN 1.1 Compute Units (Radeon R7, 384 shaders) |
-| Memory model | hUMA — single unified physical address space |
-| GPU self-dispatch | hQ (HSA heterogeneous queueing) |
-| Kernel driver | amdkfd (upstream Linux 6.x) |
+GFX9 (Vega / Raven Ridge) provides:
+
+| Feature | GFX7 (Kaveri) | GFX9 (Raven Ridge) |
+|---------|---------------|---------------------|
+| AQL dispatch | No MEC firmware → impossible | MEC firmware handles AQL natively |
+| Signal preemption | Cannot preempt wavefront | CWSR queue unmap → shadow context |
+| Page fault handling | Manual KFD trap routing | IOMMUv2 PPR / retry fault → `handle_mm_fault()` |
+| Address space | Separate CPU/GPU page tables | SVM: `malloc()` pointers valid on both |
+| XNACK | No | Hardware auto-retries on fault |
 
 ---
 
@@ -49,185 +55,109 @@ with minimal changes.
 
 | Component | Detail |
 |-----------|--------|
-| Host OS | Fedora 42 |
-| Host kernel | Locked (NVIDIA driver), not used for target |
-| ROCm version | 6.3.1 (rocm-*-18-37.rocm6.3.1.fc42) |
+| Build machine | EPYC 7502 workstation (openSUSE Leap 16.0, 192.168.1.162) |
+| Target machine | 2200G (Debian 13, 192.168.2.170, PXE boot) |
+| ROCm build host | Fedora 42 (192.168.1.8, user: dev) |
+| ROCm version | 6.3.1 (clang 20.0.0.rocm) |
 | ROCm llvm path | `/usr/lib64/rocm/llvm/bin/` |
 | Device libs | `/usr/lib64/rocm/llvm/lib/clang/18/amdgcn/bitcode/` |
-| Target kernel | Linux v6.12 (cloned as `kernel-src/`) |
-| Target CPU | `gfx700` (Sea Islands / GCN 1.1 / Kaveri) |
+| Target kernel | Linux v6.12 (source at `kernel-deb/`) |
+| Target GPU ISA | `gfx902` (Raven Ridge / GCN 5.0) |
 | Target triple | `amdgcn-amd-amdhsa` |
-| Installed ROCm packages | rocm-llvm, rocm-llvm-devel, rocm-llvm-libs, rocm-clang, rocm-clang-devel, rocm-clang-libs, rocm-lld, rocm-device-libs, rocm-comgr, rocm-core, rocminfo |
+| Kernel config | `kernel-deb/.config` |
+| PXE deploy path | `/srv/http/vmlinuz` (served via HTTP) |
+| Serial console | /dev/ttyUSB0 → target ttyS0 (115200n8) |
 
-### GFX7 ISA constraints (Kaveri = Sea Islands = GCN 1.1)
+### SSH Quick Reference
 
-| Operation | Correct GFX7 encoding | Wrong (>GFX7) encoding |
-|-----------|----------------------|------------------------|
-| 32-bit add w/o carry | `v_add_i32_e32 dst, vcc, imm, src` | `v_add_u32_e32` (GFX8+) |
-| 64-bit add w/ carry | `v_add_co_u32` + `v_addc_co_u32` (VOP3 only) | `v_addc_u32_e32` (GFX8+) |
-| Flat load/store | `flat_load_dword vd, v[addr]` (no offset) | offset operand not supported |
-| Flat load/store x2 | `flat_store_dwordx2 v[addr], v[data]` | ✓ works |
-| Inline constant range | -16 to 64 (signed) | Larger values need VOP3 |
+```bash
+# Target (2200G)
+sshpass -p admin114514 ssh root@192.168.2.170
 
-### Workaround: offset-free flat instructions
-
-GFX7 flat instructions do not accept an immediate offset operand.
-We compute the target address by adding the offset to the low 32 bits
-of the pointer using `v_add_i32_e32`. This is safe because:
-- Mailbox is 128 bytes, all offsets are < 128
-- Mailbox is page-aligned (4096-byte boundary)
-- Adding a small offset never overflows the low 32 bits of the pointer
-- No carry propagation needed
+# ROCm build host
+sshpass -p admin114514 ssh dev@192.168.1.8
+```
 
 ---
 
-## Architecture Decisions
+## Architecture: The GCN Task Model
 
-### Root Filesystem Basis
+### Core Principle
 
-**Decision: debootstrap `--variant=minbase` + musl cross-compilation, NOT LFS.**
+A GCN task is a **first-class Linux task** that happens to execute on a GPU
+wavefront. The kernel does not need a heterogeneous scheduler — CFS treats a
+sleeping GCN task the same as any other `TASK_UNINTERRUPTIBLE` task.
 
-Rationale:
-- LFS is excessive — we need a working Linux userspace, not a from-scratch distro
-- We only need to modify the syscall *entry point*, not the syscall implementations
-- `task_struct` and the scheduler core remain intact; we replace only `context_switch()` for GCN threads
+### Lifecycle of a GCN Task
 
-Boot sequence:
 ```
-BIOS → GRUB → Linux kernel (x86, loads amdkfd)
-  → initramfs: x86 init loads heteroken_module.ko
-  → /sbin/init runs as a normal x86 userspace process
-  → init forks children: default is x86, CLONE_GCN flag spawns GCN threads
-  → GCN threads communicate with kernel via mailbox (no SYSCALL instruction)
-  → Both x86 and GCN threads see the same virtual address space (hUMA)
+clone3(CLONE_GCN, &entry)
+  │
+  ├─ copy_process() → normal CoW mm, fd table, creds, etc.
+  ├─ Allocate per-task mailbox + HSA signal (kernel module)
+  ├─ Construct AQL dispatch packet (kernel module)
+  ├─ Submit AQL packet to HSA compute queue → wavefront starts on CU
+  └─ Set task state = TASK_UNINTERRUPTIBLE → schedule() returns to parent
+
+              ┌─── Wavefront running on CU ────────────────────┐
+              │  ... executes GCN code ...                     │
+              │  Needs syscall: write args to mailbox           │
+              │  Ring HSA doorbell → IH interrupt on CPU       │
+              └────────────────────────────────────────────────┘
+                              │
+              IH ISR → lookup task by mailbox addr (xarray)
+                      → wake_up_process(gcn_task)
+                              │
+              ┌─── GCN task on CPU (CFS schedules it) ────────┐
+              │  do_syscall_64(nr, args...)  ← unmodified!    │
+              │  Write result to mailbox                       │
+              │  Re-arm HSA signal                             │
+              │  Re-dispatch AQL packet → wave resumes         │
+              │  Set state = TASK_UNINTERRUPTIBLE → sleep      │
+              └────────────────────────────────────────────────┘
+
+Exit paths:
+  Cooperative: wave finishes → mailbox exit request → wakes shadow task
+               → requests queue drain/unmap → do_exit()
+  Fatal signal: CWSR queue unmap/preempt → wait for preemption fence
+               → destroy GPU context → do_exit() on shadow task
 ```
 
-Rootfs composition:
-```
-/ (NFS root or local ext4)
-├── boot/           # kernel + initramfs (x86)
-├── lib/modules/    # kernel modules including heteroken_module.ko (x86)
-├── sbin/init       # x86 binary (or script), first user process
-├── bin/            # busybox compiled for BOTH x86 AND amdgcn targets
-├── lib/            # glibc for x86, musl for amdgcn
-├── etc/            # minimal config files (text)
-└── usr/            # additional x86 and GCN user binaries
-```
+### What the Kernel Module Owns (and ONLY this)
 
-systemd is excluded entirely. Init is busybox init or a minimal script.
+| Responsibility | Mechanism |
+|---------------|-----------|
+| **Clone path hook** | Intercept `clone3(CLONE_GCN)` → allocate mailbox + HSA signal + construct + submit AQL packet → set task UNINTERRUPTIBLE |
+| **Mailbox / doorbell service** | IH interrupt → xarray lookup `mailbox_addr → task_struct` → `wake_up_process()` |
+| **Dispatch** | AQL packet construction + HSA queue submission (MEC firmware handles the rest) |
+| **Signal / CWSR bridge** | Fatal signal → CWSR queue unmap preempt → wait fence → destroy GPU context → exit shadow task |
+| **/sys node exposure** | `/sys/devices/system/node/nodeX/heteroken/{type,compute_units,isa}` |
 
-Rationale for allowing x86 user threads:
-- Avoids a "bootstrap deadlock" where init must dispatch itself to GCN before it can run
-- I/O-heavy and low-latency threads are better on x86; vector-heavy threads are better on GCN
-- The "no interrupt on GCN" invariant is independent; x86 user threads don't violate it
-- No code impact on syscall handlers: `do_syscall_64()` serves both x86 SYSCALL and GCN mailbox
+### What Is NOT Modified
+
+| Kernel component | Why it doesn't need changes |
+|-----------------|-----------------------------|
+| Core scheduler (CFS) | GCN task is `TASK_UNINTERRUPTIBLE` when on CU, `TASK_RUNNING` when on CPU — normal CFS behavior |
+| `do_syscall_64()` | Called by the GCN task itself on CPU — same fd table, same creds, same mm |
+| Page fault handler | IOMMUv2 PPR routes GPU faults to `handle_mm_fault()` on the task's mm automatically |
+| Signal delivery (normal) | Fatal signals use CWSR; non-fatal are deferred to next CPU visit |
+| Interrupt handling | Irrelevant — IH handles the GPU→CPU doorbell, not the CU itself |
 
 ### Mailbox Protocol
 
-**Decision: Mailbox replaces the x86 `SYSCALL` instruction, NOT the syscall handler.**
-
-In normal Linux, the syscall path is:
-```
-Userspace: mov $nr, %rax; SYSCALL     →  CPU traps to kernel
-Kernel:    entry_SYSCALL_64()          →  do_syscall_64(nr, args...)
-Userspace: result in %rax
-```
-
-In HeteroKern for GCN threads:
-```
-GCN CU:     write nr+args to mailbox   →  set state=1 (pending)
-x86 poller: detects state==1           →  do_syscall_64(nr, args...)  ← same function!
-x86 poller: writes result to mailbox   →  set state=0 (done)
-GCN CU:     reads result from mailbox  →  continues execution
-```
-
-Linux already supports multiple syscall entry mechanisms per architecture
-(x86 has `int $0x80`, `SYSENTER`, `SYSCALL`). The mailbox adds one more entry
-mechanism. The actual kernel handler (`do_syscall_64`, individual `sys_*`
-functions) are untouched.
-
-This is architecturally equivalent to:
-- **virtio** — guest-to-host communication via shared virtqueues
-- **io_uring** — userspace-to-kernel via shared SQ/CQ rings
-- **HSA doorbell** — GPU-to-CPU signaling via shared memory + doorbell
-
-### Kernel Modifications Scope
-
-**We do NOT rewrite the scheduler. We add a heterogeneous dispatch path.**
-
-| Kernel component | Modified? | How |
-|-----------------|-----------|-----|
-| `task_struct` | Augmented | Add fields: `core_type` (CPU_CORE / GCN_CU), `mailbox_ptr`, `gcn_context` |
-| `do_fork()` / `copy_process()` | Augmented | `CLONE_GCN` flag → child gets `core_type=GCN_CU`, allocates mailbox |
-| `__schedule()` / `context_switch()` | Intercepted | If `next->core_type == GCN_CU`, call `dispatch_to_gcn(next)` instead of `switch_to()` |
-| `do_syscall_64()` | NOT modified | Called from both x86 `entry_SYSCALL_64` and GCN mailbox poller — same entry point |
-| Page fault handler | Augmented | GCN page faults arrive via KFD trap → forwarded to x86 `do_page_fault()` |
-| Signal delivery | Augmented | Signals to x86 threads: normal path. Signals to GCN threads: queued in mailbox |
-| Interrupt handling | NOT modified | Interrupts physically cannot reach GCN CUs (no IRQ lines wired) |
-
-### Heterogeneous Scheduling Design
+The mailbox replaces the `SYSCALL` instruction for GCN tasks. It does NOT
+replace the syscall handler.
 
 ```
-                    ┌── pick_next_task() ──┐
-                    │                      │
-              core_type ==             core_type ==
-               CPU_CORE                  GCN_CU
-                    │                      │
-              switch_to()           dispatch_to_gcn()
-              (x86 context          (write AQL packet
-               switch)               to HSA queue)
-                    │                      │
-              x86 core runs          GCN CU runs
-              next user thread      wavefront
+GCN CU:     write nr+args to mailbox   →  ring doorbell (HSA signal)
+IH ISR:     mailbox addr → xarray → task_struct  →  wake_up_process()
+CPU:        GCN task runs do_syscall_64(nr, args...)  ← same function!
+CPU:        Write result to mailbox     →  re-arm signal + re-dispatch AQL
+GCN CU:     Read result from mailbox    →  wavefront resumes
 ```
 
-Scheduling policy:
-- `fork()` without CLONE_GCN → child inherits parent's core type
-- `clone(CLONE_GCN)` → child forced to GCN CU (parent can be CPU or GCN)
-- System-wide load balancer treats GCN CUs as additional "CPUs" in the run queue graph
-- Affinity: `sched_setaffinity()` extended with a core-type bitmask
-- No implicit migration between CPU and GCN unless explicitly requested (different ISA!)
-
-Implicit in this design:
-- CPU threads use normal x86 SYSCALL instruction for syscalls
-- GCN threads use mailbox protocol for syscalls
-- Both paths call the same `do_syscall_64()`
-- hUMA shared memory means CPU and GCN threads share the same virtual address space
-- `mmap()`, shared memory, pipes work identically between CPU and GCN threads
-
----
-
-## Implementation Phases
-
-### Phase A: Toolchain Setup [OFFLINE — 2-3 days]
-
-| # | Task | Verification |
-|---|------|-------------|
-| A1 | Install `clang` with `amdgcn-amd-amdhsa` target | `clang --target=amdgcn-amd-amdhsa -c test.c -o test.o` succeeds |
-| A2 | Install ROCm device-libs (libc.bc, libm.bc for GCN) | `/opt/rocm/lib/amdgcn/bitcode/libc.bc` exists |
-| A3 | Install `libhsakmt` development headers | `pkg-config --cflags libhsakmt` works |
-| A4 | Install `rocr-runtime` or build minimal HSA user lib | Can link against HSA ABI |
-| A5 | Set up PXE + NFS server for A8-7500 | TFTP serves kernel, NFS exports rootfs |
-| A6 | Write top-level build system (Makefile) | `make all` builds x86 module + GCN binaries |
-
-### Phase B: Minimal GCN Kernel Code [OFFLINE — 3-5 days]
-
-| # | Task | Verification |
-|---|------|-------------|
-| B1 | `gcn/hello_gcn.S` — write a magic value to a known hUMA address | Assembles to valid `.hsaco` |
-| B2 | `gcn/mailbox.S` — GCN assembly macros for mailbox R/W | Compiles, `llvm-objdump -d` shows correct GCN ISA |
-| B3 | `gcn/trap_handler.S` — minimal trap handler skeleton | Compiles |
-| B4 | Build script: `.S → .o → .hsaco` | `file *.hsaco` reports `AMDGPU code object` |
-
-### Phase C: Mailbox Protocol Definition [OFFLINE — 4-6 days]
-
-| # | Task | Verification |
-|---|------|-------------|
-| C1 | `include/mailbox.h` — shared mailbox struct definition | Compiles for both x86 and amdgcn targets |
-| C2 | GCN side `gcn/syscall_shim.c` — fill mailbox, wait for reply | Compiles to GCN ISA, verified via `llvm-objdump` |
-| C3 | x86 side `kernel/mailbox_handler.c` — poll loop, call do_syscall | Compiles as kernel module |
-| C4 | Unit tests for mailbox state machine | `make test_mailbox` passes on x86 host |
-| C5 | Simulated integration test (x86 side mocks GCN writes) | Protocol correctness verified |
+This is architecturally equivalent to virtio (guest→host via virtqueue),
+io_uring (userspace→kernel via shared rings), or HSA doorbell itself.
 
 Mailbox structure (128 bytes, cache-line aligned):
 ```
@@ -242,132 +172,248 @@ Offset  Size    Field           Description
 0x54    44      reserved        Padding to 128 bytes
 ```
 
-### Phase D: Kernel Module Skeleton [OFFLINE — 4-6 days]
+### Signal Handling on GCN Tasks
+
+GFX9 provides CWSR (CWSR = Compute Wavefront Save/Restore):
+
+- **Non-fatal signals** (e.g. SIGUSR1): deferred until the GCN task next
+  visits the CPU (at a syscall boundary). The signal is pending in
+  `task_struct::pending`; when the task wakes on CPU it checks `TIF_SIGPENDING`
+  before re-dispatching. Handler executes on the shadow context (CPU-side
+  saved register state).
+
+- **Fatal signals** (SIGKILL, SIGTERM with default disposition, SIGSEGV):
+  CWSR queue unmap preempts the wavefront immediately. The kernel module
+  waits for the preemption fence/event, destroys the GPU context (queue,
+  doorbell, mailbox), then the shadow task calls `do_exit()`.
+
+- **Shadow context**: each live GCN task owns a private slot (allocated from a
+  shared pool) for SGPR/VGPR save area. Shared global save memory is unsafe —
+  a preempted task must have its own isolated save region.
+
+### Fault Handling
+
+On GFX9 with IOMMUv2:
+
+1. GPU wavefront accesses an unmapped or read-only page
+2. IOMMUv2 generates a PPR (Peripheral Page Request) or retry fault
+3. The fault is attributed to the GCN task's `mm` (via PASID)
+4. `handle_mm_fault()` resolves it — same path as CPU page faults
+5. Wavefront automatically retries the access (XNACK) or is restarted
+
+No custom fault routing is needed. This is a major simplification over the
+GFX7 approach (manual KFD trap handler → mailbox forwarding).
+
+### Root Filesystem
+
+**Decision: debootstrap `--variant=minbase` + musl cross-compilation, NOT LFS.**
+
+The target runs a standard Debian 13 rootfs (already deployed on the 2200G's
+local SSD). GCN binaries are cross-compiled and deployed alongside x86 ones.
+
+```
+/ (local ext4 on /dev/sda2)
+├── boot/           # Debian stock kernels (fallback)
+├── lib/modules/    # kernel modules
+├── sbin/init       # x86 binary, first user process
+├── bin/            # x86 binaries + GCN binaries (future)
+├── lib/            # glibc for x86, musl for amdgcn (future)
+├── etc/            # minimal config
+└── usr/            # additional binaries
+```
+
+systemd is excluded. Init is busybox init or a minimal script.
+
+---
+
+## Implementation Phases
+
+### Phase 0: 2200G Bring-Up [ONLINE — 1-2 days] 🚨 BLOCKER
 
 | # | Task | Verification |
 |---|------|-------------|
-| D1 | `kernel/heteroken_main.c` — module init/exit | `insmod` succeeds on dev machine (no-op) |
-| D2 | `kernel/hsa_queue.c` — HSA queue create/destroy via KFD ioctl | Compiles, API calls verified against kernel headers |
-| D3 | `kernel/procfs.c` — /proc/heteroken/ debug interface | Compiles |
-| D4 | `kernel/kbuild.mk` — Kbuild integration | `make -C /lib/modules/$(uname -r)/build M=$(pwd)` succeeds |
+| 0.1 | Update kernel config: replace Kaveri firmware in `CONFIG_EXTRA_FIRMWARE` with Raven firmware | `zcat /proc/config.gz \| grep EXTRA_FIRMWARE` shows raven_*.bin |
+| 0.2 | OR: configure PXE to also serve an initramfs containing Raven firmware | amdgpu initializes before rootfs mount |
+| 0.3 | Rebuild kernel + deploy to PXE + reboot target | `dmesg \| grep amdgpu` shows successful init |
+| 0.4 | Verify KFD sees GPU: `/sys/devices/virtual/kfd/kfd/topology/nodes/1/` exists with simd_count > 0 | `rocminfo` shows gfx902 agent |
+| 0.5 | Verify `/dev/kfd` and `/dev/dri/renderD128` both exist | Both device nodes present |
+| 0.6 | Install `rocminfo` on target (if not present) | `rocminfo` reports CU count, ISA, SVM pools |
 
-### Phase E: GCN Syscall Shim + musl Port Start [OFFLINE — 5-8 days]
+**Current blocker**: The PXE kernel has `CONFIG_EXTRA_FIRMWARE` hardcoded to
+Kaveri firmware only. amdgpu fails to load `raven_gpu_info.bin` during early
+boot (before rootfs is mounted). Fix requires either building Raven firmware
+into the kernel image, or serving an initramfs with firmware files.
 
-| # | Task | Verification |
-|---|------|-------------|
-| E1 | `gcn/gcnsyscall.h` — GCN_SYSCALL0..6 macros | Compiles amdgcn, `llvm-objdump` validates |
-| E2 | `gcn/gcnsyscall.c` — full `__gcnsyscall` implementation | Compiles |
-| E3 | `gcn/crt0_gcn.S` — `_start` for GCN executables | Compiles, objdump shows correct entry |
-| E4 | Port first 5 musl syscall wrappers (write, read, exit, brk, mmap) | Compiles for amdgcn |
-| E5 | `gcn/linker.ld` — linker script for GCN executables | `ld.lld` accepts it |
+### Phase 1: AQL Dispatch End-to-End [ONLINE — 3-5 days] 🎯 FIRST MILESTONE
 
-### Phase F: Scheduler + Heterogeneous Thread Model [OFFLINE — 4-6 days]
-
-| # | Task | Verification |
-|---|------|-------------|
-| F1 | `include/gcn_thread.h` — `core_type` enum, `gcn_context`, mailbox linkage | Compiles for x86 |
-| F2 | `kernel/scheduler.c` — heterogeneous run queues: per-x86-core + per-GCN-CU | Unit tests pass |
-| F3 | `kernel/context.c` — GCN context save/restore (SGPR/VGPR/LDS) | Logic tests pass |
-| F4 | `kernel/dispatch.c` — AQL packet construction + queue submission for GCN threads | Compiles |
-| F5 | `kernel/clone_gcn.c` — hook in `copy_process()`: allocate mailbox, set `core_type=GCN_CU` | Compiles |
-| F6 | Scheduler unit tests with mocked HSA dispatch, both CPU and GCN paths | `make test_scheduler` passes |
-
-### Phase G: KFD Integration Layer [OFFLINE compile / ONLINE test — 3-4 days]
-
-| # | Task | Needs HW | Verification |
-|---|------|----------|-------------|
-| G1 | Enumerate GCN CUs via KFD topology ioctl | 🔴 | List of visible CU nodes |
-| G2 | Create HSA queue per CU | 🔴 | `kfd_ioc_create_queue` succeeds |
-| G3 | Register KFD trap/event handler for GCN page faults | 🔴 | Trap events reach handler |
-| G4 | Allocate hUMA shared memory region (mailbox ring + scratch) | 🔴 | `mmap` from `/dev/kfd` succeeds |
-| G5 | AQL packet constructor `kernel/aql.c` | ⬜ | Compiles, packet format validated |
-
-### Phase H: End-to-End Hello World [ONLINE — 2-3 days] 🎯 FIRST MAJOR MILESTONE
+This is the old "Phase H" reborn on GFX9 — prove that we can dispatch a GCN
+wavefront and read a result back.
 
 | # | Task | Verification |
 |---|------|-------------|
-| H1 | Deploy kernel + module + GCN binary to A8-7500 | Boots, amdkfd loads |
-| H2 | Create compute queue via kallsyms bypass kernel module | Queue created with id=0, db_off=0 |
-| H3 | Load GCN kernel code into GPU memory + update MQD | Code loaded, MQD registers set |
-| H4 | Submit PM4 DISPATCH_DIRECT + ring doorbell | Doorbell rung, packet written |
-| H5 | GCN kernel executes and writes magic value to hUMA | **BLOCKED**: CIK needs INDIRECT_BUFFER to load shader (MQD shader regs not used by CP) |
-| H6 | x86 reads magic value from shared memory → Phase H complete | pending |
+| 1.1 | Adapt `heteroken.c` for GFX9: queue format AQL (`KFD_QUEUE_FORMAT_AQL`), not PM4 | Compiles in-tree |
+| 1.2 | Remove all CIK-specific code: PM4 packets, MQD manual register writes, INDIRECT_BUFFER | Code clean |
+| 1.3 | GPU memory allocation: SVM means `va_addr=0` works (no explicit GPU VA needed) | Allocation succeeds |
+| 1.4 | AQL dispatch packet: `hsa_kernel_dispatch_packet_t` with `kernel_object` pointer → MEC loads shader | Wavefront executes |
+| 1.5 | Rebuild `hello_gcn` targeting `gfx902` instead of `gfx700` | `llvm-objdump` shows GFX9 ISA |
+| 1.6 | Full pipeline: process → VM → bind → alloc → queue → AQL dispatch → result read | Magic value read back from GPU memory |
+| 1.7 | Doorbell via `adev->doorbell.cpu_addr` (unchanged from CIK work) | Reliable doorbell ring |
 
-**H5 block detail**: CIK compute queues do not use the MQD's `compute_pgm_lo/hi`
-registers for shader dispatch.  KFD never sets these registers (verified in
-`kfd_mqd_manager_cik.c`).  The CP interprets DISPATCH_DIRECT by reading the
-shader from the MQD, but the MQD defaults to 0.  Correct dispatch requires
-`PACKET3_INDIRECT_BUFFER` → SET_SH_REG (configure shader) → DISPATCH_DIRECT.
+**What ports directly from CIK work** (steps 1-8 of `heteroken.c`):
+- Process creation, VM init, device binding
+- GPU buffer allocation + mapping (simplified: no explicit GPU VA)
+- Queue creation (`pqm_create_queue`)
+- Doorbell access
+- sysfs trigger interface
+- Kernel descriptor construction
 
-Next research: CIK INDIRECT_BUFFER packet format + shader register addresses.
-See `docs/phase-h-dispatch-notes.md`.
+**What is new on GFX9**:
+- Queue format: `KFD_QUEUE_FORMAT_AQL` instead of `KFD_QUEUE_FORMAT_PM4`
+- Dispatch: AQL packet instead of PM4 `DISPATCH_DIRECT`
+- No MQD manual register manipulation (MEC reads descriptor directly)
+- SVM eliminates explicit GPU VA management
 
-### Phase I: Full Syscall Set [ONLINE — 4-6 days]
-
-| # | Task | Verification |
-|---|------|-------------|
-| I1 | Implement remaining essential syscalls (~50) in musl GCN shim | Each syscall tested individually |
-| I2 | File I/O: open, close, read, write, lseek, stat, fstat | File operations work |
-| I3 | Memory: mmap, munmap, brk, mprotect | Memory allocation works |
-| I4 | Process: fork, execve, wait4, exit, getpid | fork/exec round-trip works on GCN |
-| I5 | Pipe/dup: pipe2, dup, dup2 | Pipes between GCN processes |
-
-### Phase J: musl libc Deep Port [ONLINE — 2-4 weeks]
+### Phase 2: Mailbox + IH Interrupt Path [ONLINE — 4-6 days]
 
 | # | Task | Verification |
 |---|------|-------------|
-| J1 | Port musl internal threading (clone → GCN wavefront spawn) | pthread_create works on GCN |
-| J2 | Port musl stdio (buffered I/O) | printf, scanf work |
-| J3 | Port musl malloc (dlmalloc or similar) | malloc/free under GCN memory model |
-| J4 | Port musl dynamic linker (ld-musl-amdgcn.so) | Shared libraries work on GCN |
-| J5 | Signal handling via mailbox (signals are "software" only) | kill(2), signal handlers fire |
+| 2.1 | `include/mailbox.h` — update mailbox struct for new protocol (same layout, confirm alignment) | Compiles for both x86 and amdgcn |
+| 2.2 | GCN-side mailbox write + doorbell ring: wavefront writes args, signals CPU | `llvm-objdump` validates ISA |
+| 2.3 | xarray: `mailbox_gpu_addr → task_struct` lookup, registered at dispatch time | Lookup returns correct task |
+| 2.4 | IH ISR hook: on doorbell interrupt, resolve mailbox → task → `wake_up_process()` | Woken task runs on CPU |
+| 2.5 | GCN task on CPU: read mailbox → call `do_syscall_64()` → write result → re-dispatch AQL → sleep | Syscall executed as the GCN task |
+| 2.6 | Test: GCN wavefront issues `write(1, "hello from CU\n", 14)` via mailbox → output appears on stdout | End-to-end syscall works |
 
-### Phase K: Busybox Port [ONLINE — 1-2 weeks]
-
-| # | Task | Verification |
-|---|------|-------------|
-| K1 | Cross-compile busybox for amdgcn-amd-amdhsa | All applets compile |
-| K2 | Test shell (ash) on GCN | Interactive shell works via serial |
-| K3 | Test coreutils equivalents (ls, cp, mv, cat, etc.) | Basic file operations |
-| K4 | Test networking tools (ifconfig, ping, wget) | Networking over GCN dispatches |
-| K5 | Full busybox test suite passed | All enabled applets functional |
-
-### Phase L: Performance Optimization [ONLINE — ongoing]
+### Phase 3: Clone Hook + GCN Task Birth [ONLINE + OFFLINE — 4-6 days]
 
 | # | Task | Verification |
 |---|------|-------------|
-| L1 | Optimize mailbox polling (reduce x86 to GCN latency) | syscall latency measured |
-| L2 | Lazy VGPR save/restore (only save if VGPRs used) | Context switch cost reduced |
-| L3 | Large time quanta for GCN threads to amortize dispatch cost | Throughput measured |
-| L4 | GCN vector intrinsic examples (demonstrate SIMD throughput) | GFLOPS measured |
-| L5 | Batch syscall processing (x86 handles multiple at once) | syscall throughput improved |
+| 3.1 | Define `CLONE_GCN` flag value (`0x100000000` — bit 32 of clone3 flags) | Header file updated |
+| 3.2 | `struct hk_gcn_entry` — code_fd, kernel name, arg pointer, flags | Header + userspace API |
+| 3.3 | Hook `copy_process()`: detect `CLONE_GCN` → allocate mailbox, HSA signal, shadow context slot | Child task has GPU context |
+| 3.4 | Post-clone: construct AQL packet from `hk_gcn_entry`, submit to HSA queue, set task UNINTERRUPTIBLE | Task sleeping, wave running |
+| 3.5 | `libheteroken` userspace wrapper: `hk_spawn(entry, clone_flags)` → `clone3()` | Test program compiles |
+| 3.6 | Test: `hk_spawn()` creates GCN task, it runs, writes result, exits | Test 0 + Test 1 from tests.txt |
+
+### Phase 4: CoW Semantics + Address Space [ONLINE — 3-5 days]
+
+| # | Task | Verification |
+|---|------|-------------|
+| 4.1 | Verify CoW: `hk_spawn(entry, 0)` (no CLONE_VM) → child gets CoW copy of parent mm | Child writes don't affect parent |
+| 4.2 | Verify shared: `hk_spawn(entry, CLONE_VM)` → shared address space | Child writes visible to parent |
+| 4.3 | Verify fd table: GCN task opens a file → appears in `/proc/<pid>/fd` | Correct fd ownership |
+| 4.4 | Test: Test 2 from tests.txt — CoW fork semantics, same VAs | Pass |
+
+### Phase 5: Signal Handling + CWSR [ONLINE — 5-7 days]
+
+| # | Task | Verification |
+|---|------|-------------|
+| 5.1 | Non-fatal signal path: defer until next CPU visit, check `TIF_SIGPENDING` before re-dispatch | SIGUSR1 handler fires on CPU |
+| 5.2 | Fatal signal path: CWSR queue unmap → wait preemption fence → destroy GPU context → `do_exit()` | SIGKILL kills GCN task < 100ms |
+| 5.3 | SIGSEGV: null-pointer store on CU → IOMMUv2 fault → signal delivered to GCN task | Correct `si_addr` in siginfo |
+| 5.4 | Shadow context: allocate from shared pool, each live task owns a private slot | Preemption save area isolated |
+| 5.5 | Test: Test 4 from tests.txt — spinning GCN task is killable | Pass (the smoke test GFX7 could never pass) |
+
+### Phase 6: IPC Across ISA Boundary [ONLINE — 3-5 days]
+
+| # | Task | Verification |
+|---|------|-------------|
+| 6.1 | Pipe: CPU writes → GCN reads (and vice versa) via `read()`/`write()` syscalls through mailbox | Data flows correctly |
+| 6.2 | Futex: GCN task `FUTEX_WAIT`, CPU task `FUTEX_WAKE` — proves mailbox composes with sleeping syscalls | GCN waiter wakes |
+| 6.3 | Shared memory: CPU and GCN tasks share mmap'd region (SVM makes this trivial) | Both see same data |
+| 6.4 | Test: Test 5 from tests.txt — pipe + futex across ISA boundary | Pass |
+
+### Phase 7: Heterogeneous Fan-Out [ONLINE — 3-4 days] 🎯 SECOND MILESTONE
+
+| # | Task | Verification |
+|---|------|-------------|
+| 7.1 | SAXPY benchmark: parent forks N GCN tasks + M CPU tasks over one array | Correct result |
+| 7.2 | Verify GCN tasks appear in `top` / `ps` as normal tasks | Visible |
+| 7.3 | GCN chunks beat one CPU core on FP32 throughput (sanity, not benchmark) | Measured |
+| 7.4 | Test: Test 6 from tests.txt — heterogeneous fan-out | Pass |
+
+### Phase 8: Negative Tests + Robustness [ONLINE — 3-4 days]
+
+| # | Task | Verification |
+|---|------|-------------|
+| 8.1 | `execve()` from GCN task: either continue as x86 or fail with documented errno — never wedge | Documented behavior |
+| 8.2 | x86 function pointer as kernel entry: spawn fails with `-ENOEXEC`, no GPU hang | Clean failure |
+| 8.3 | 1000 sequential spawn/exit cycles: no CU/queue/doorbell leak | KFD queue counts return to baseline |
+| 8.4 | Test: Test 7 from tests.txt — negative tests | Pass |
+
+### Phase 9: /sys Topology + NUMA [ONLINE — 2-3 days]
+
+| # | Task | Verification |
+|---|------|-------------|
+| 9.1 | Expose GPU as a NUMA node: `/sys/devices/system/node/node1/heteroken/type` = `GCN_CU` | Visible |
+| 9.2 | `/sys/devices/system/node/node1/heteroken/compute_units` = `8` | Correct |
+| 9.3 | `/sys/devices/system/node/node1/heteroken/isa` = `amdgcn-gfx902` | Correct |
+| 9.4 | `set_mempolicy(MPOL_BIND, gpu_node)` — documented behavior on APU (EINVAL or node0) | Deterministic |
+| 9.5 | Test: Test 0 + Test 3 from tests.txt | Pass |
+
+### Phase 10: musl Port + Busybox [ONLINE — 2-4 weeks]
+
+| # | Task | Verification |
+|---|------|-------------|
+| 10.1 | Port musl internal threading: `clone()` → GCN wavefront spawn via `hk_spawn()` | `pthread_create` works on GCN |
+| 10.2 | Port musl stdio (buffered I/O) | `printf`, `scanf` work on GCN |
+| 10.3 | Port musl malloc | `malloc`/`free` under GCN memory model |
+| 10.4 | Cross-compile busybox for `amdgcn-amd-amdhsa` | All applets compile |
+| 10.5 | Test shell (ash) on GCN | Interactive shell via serial |
+| 10.6 | Test coreutils equivalents (ls, cp, mv, cat) | Basic file operations |
+
+### Phase 11: dGPU as NUMA Node [FUTURE — requires discrete GPU]
+
+This phase extends the model to discrete GPUs with local VRAM, treating them
+as NUMA nodes with their own memory. Not implemented on the 2200G.
+
+| # | Task | Verification |
+|---|------|-------------|
+| 11.1 | `set_mempolicy(MPOL_BIND, dgpu_node)` allocates pages in VRAM | Pages on GPU node |
+| 11.2 | GCN task with `MPOL_LOCAL` allocates in local VRAM by default | Default behavior correct |
+| 11.3 | Migration: pages can be migrated between CPU and GPU nodes | Data movement works |
 
 ---
 
 ## Key Invariants
 
-1. **No interrupt ever fires on a GCN CU** — guaranteed by hardware (no IRQ lines wired)
-2. **GCN threads communicate with kernel via mailbox** — no SYSCALL instruction available on GCN
-3. **x86 threads use standard SYSCALL instruction** — normal x86 userspace works unchanged
-4. **All privileged operations happen on x86 in kernel context** — both entry paths converge at `do_syscall_64()`
-5. **Unified address space** — hUMA: CPU and GPU share the same page tables and virtual addresses
-6. **Core type is set at clone() time** — `clone(CLONE_GCN)` spawns GCN wavefront; default spawns x86 thread
+1. **GCN task is a real task_struct** — created by `clone3()`, has its own pid, mm, fd table, creds
+2. **Core scheduler is unmodified** — CFS schedules GCN tasks normally (sleeping when on CU, runnable on CPU)
+3. **Syscall handlers are unmodified** — `do_syscall_64()` is called by the GCN task on CPU
+4. **Fault handlers are unmodified** — IOMMUv2 PPR routes GPU faults to `handle_mm_fault()` on the task's mm
+5. **Unified address space** — SVM: CPU and GPU share the same page tables and virtual addresses
+6. **Core type is set at clone3() time** — `CLONE_GCN` spawns GCN wavefront; default spawns x86 thread
+7. **No implicit migration between CPU and GCN** — different ISA, set at birth
 
 ## Hard Problems (Ranked)
 
-1. **GCN wavefront ≠ CPU thread**: 64 lanes in lockstep. Single-threaded code needs scalar ALU paths for control flow divergence.
-2. **No hardware call stack**: GCN uses scratch memory — must be managed by compiler/linker.
-3. **Page fault handling**: GCN page faults routed via KFD trap → x86 handler. amdkfd already supports this; we integrate, not reinvent.
-4. **Context switch cost**: GCN register file is large. Mitigation: large time quanta, lazy VGPR save.
-5. **libc port**: musl assumes x86 syscall ABI. Each arch-specific file replaced with GCN mailbox shim.
+1. **IH → task_struct lookup**: mapping a mailbox doorbell event to the correct
+   sleeping task via xarray. Must be O(1) under interrupt context.
+2. **CWSR preemption fence**: fatal signals must wait for the hardware to
+   complete wavefront save before destroying context. Timing-sensitive.
+3. **Shadow context slot management**: shared pool with per-task private
+   isolation. Must not leak slots on crash/kill paths.
+4. **CoW correctness**: GPU page faults on CoW pages must fault on the GPU
+   side and be resolved by IOMMUv2 → `handle_mm_fault()`. Need to verify
+   the full CoW path works through IOMMUv2.
+5. **libc port**: musl assumes x86 syscall ABI. Each arch-specific file
+   replaced with GCN mailbox shim.
 
 ## What Exists and Must NOT Be Rewritten
 
 - **amdkfd** — upstream Linux kernel driver for AMD HSA
-- **libhsakmt** — HSA kernel-mode thunk library API
+- **amdgpu** — upstream DRM driver (handles display, firmware, power management)
 - **HSA ABI** — AMD-documented queue/dispatch packet format
 - **GCN ISA** — fully documented by AMD
 - **LLVM amdgcn backend** — compiles C to GCN machine code
+- **IOMMUv2 PPR** — hardware fault routing to `handle_mm_fault()`
+- **CWSR** — hardware wavefront save/restore (GFX9+)
+
+### Code Reuse from CIK Work
+
+The entire `heteroken.c` infrastructure (process creation, VM init, binding,
+buffer allocation, queue creation, doorbell access, sysfs trigger) is directly
+portable. See `docs/cik-lessons.md` section "What Stays".
 
 ---
 
@@ -377,10 +423,11 @@ See `docs/phase-h-dispatch-notes.md`.
 APUkernel/
 ├── Makefile              # Top-level build orchestration
 ├── Roadmap.md            # This file
+├── README.md             # Project overview
 ├── include/
 │   ├── mailbox.h         # Shared mailbox struct (both targets)
-│   ├── gcn_thread.h      # Per-thread state structure
-│   └── protocol.h        # Syscall number mappings, constants
+│   ├── gcn_thread.h      # Per-task GPU context structure
+│   └── protocol.h        # CLONE_GCN flag, syscall mappings, constants
 ├── gcn/                  # amdgcn target code
 │   ├── hello_gcn.S       # Minimal GCN kernel
 │   ├── mailbox.S         # GCN assembly mailbox primitives
@@ -397,28 +444,40 @@ APUkernel/
 ├── kernel-patches/        # Kernel modifications (managed by git)
 │   ├── heteroken.c        # In-tree KFD module: create queue + dispatch
 │   └── amdkfd-makefile.patch  # Adds heteroken.o to AMDKFD_FILES
-├── scripts/               # Automation (not tracked by git — contains credentials)
-│   ├── deploy-test.sh     # SCP → build → insmod (old out-of-tree path)
+├── kernel-deb/            # Linux 6.12 kernel source (patched, built for PXE)
+├── scripts/               # Automation
+│   ├── build-kernel.sh    # Build kernel + deploy bzImage to PXE
+│   ├── kernel-test.sh     # Rebuild + deploy + reboot + trigger test
 │   ├── reboot.sh          # sysrq reboot + wait for SSH
-│   ├── cycle.sh           # reboot → deploy → test loop
-│   ├── build-gcn.sh       # Compile gcn/*.S → .hsaco
-│   ├── kernel-test.sh     # Rebuild + deploy + reboot + trigger sysfs test
+│   ├── hw-check.sh        # Check target hardware status
 │   ├── apply-kernel-patch.sh  # Apply heteroken changes to clean kernel tree
-│   └── build-kernel.sh    # Build kernel + deploy bzImage to PXE
-├── tests/                # Unit/integration tests (x86 host)
-│   ├── test_mailbox.c    # Mailbox protocol unit tests
-│   ├── test_scheduler.c  # Scheduler logic tests
-│   └── test_mock.c       # Mock HSA dispatch for integration tests
+│   ├── build-gcn.sh       # Compile gcn/*.S → .hsaco
+│   ├── deploy-test.sh     # SCP → build → insmod (old out-of-tree path, OBSOLETE)
+│   └── cycle.sh           # reboot → deploy → test loop
+├── tests/
+│   ├── tests.txt          # Terminal test definitions
+│   ├── test_mailbox.c     # Mailbox protocol unit tests
+│   ├── test_scheduler.c   # Scheduler logic tests
+│   └── test_mock.c        # Mock HSA dispatch for integration tests
 ├── rootfs/               # Root filesystem build scripts
 │   ├── mkrootfs.sh       # debootstrap + customize script
 │   ├── init.c            # Minimal init (x86 bootstrap)
 │   └── gcn_init.c        # GCN-compiled /sbin/init
-├── pxe/                  # PXE + NFS server config
+├── pxe/                  # PXE server config
 │   ├── dhcpd.conf
 │   ├── grub.cfg
 │   └── exports
+├── tmp/                  # Working state (not tracked)
+│   └── state.md          # Current machine state + handoff notes
 └── docs/                 # Design documents, notes
-    └── gcn_isa_notes.md  # GCN ISA references and gotchas
+    ├── cik-lessons.md        # CIK dispatch analysis + migration rationale
+    ├── gfx7-vs-gfx9.md      # SVM comparison (historical)
+    ├── phase-h-dispatch-notes.md  # CIK dispatch debugging log
+    ├── kernel-hack-notes.md  # Why kallsyms bypass was needed
+    ├── kernel-patch-plan.md  # Plan to fix KFD ioctl for no-SVM
+    ├── why-offsets.md        # Offset guessing explanation
+    ├── kernel-compile.md     # Kernel build instructions
+    └── gcn_isa_notes.md      # GCN ISA references
 ```
 
 ---
@@ -484,3 +543,7 @@ APUkernel/
 | 2026-06-05 | — | scripts/: apply-kernel-patch.sh, build-kernel.sh, kernel-test.sh | ✅ |
 | 2026-06-05 | — | docs/cik-lessons.md: CIK dispatch analysis + migration plan | ✅ |
 | 2026-06-05 | — | tmp/state.md: current machine state + handoff notes | ✅ |
+| 2026-06-12 | — | **Platform migrated**: A8-7500 → 2200G (Raven Ridge, gfx902) at 192.168.2.170 | ✅ |
+| 2026-06-12 | — | **Architecture redesigned**: GCN task model — real task_struct, unmodified scheduler/handlers | ✅ |
+| 2026-06-12 | 0 | 2200G boots PXE, but amdgpu init fails: missing Raven firmware in CONFIG_EXTRA_FIRMWARE | 🔧 |
+| 2026-06-12 | — | Roadmap rewritten for new platform + new architecture | ✅ |
