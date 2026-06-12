@@ -14,6 +14,7 @@
 #include <linux/io.h>
 #include <linux/sysfs.h>
 #include "kfd_priv.h"
+#include "kfd_device_queue_manager.h"
 #include "../amdgpu/amdgpu_amdkfd.h"
 
 /*
@@ -196,6 +197,12 @@ static int hk_run(void)
 		if (ret) { pr_err("hk: create_queue: %d\n", ret); goto out; }
 		hk_ready = true;
 		pr_info("hk: QUEUE CREATED  id=%u  db_off=0x%x\n", hk_qid, db_off);
+
+		/* Sync GPU TLB: ensure ring/wptr/rptr mappings visible to CP */
+		amdgpu_amdkfd_gpuvm_sync_memory(adev, ring_mem, false);
+		amdgpu_amdkfd_gpuvm_sync_memory(adev, wptr_mem, false);
+		amdgpu_amdkfd_gpuvm_sync_memory(adev, rptr_mem, false);
+		pr_info("hk: GPU memory synced\n");
 	}
 
 	/* 5. Load kernel code + descriptor + args */
@@ -248,31 +255,42 @@ static int hk_run(void)
 	mqd[34] = (HK_GPUVA_ARGS >> 32) & 0xFFFFFFFF;
 	pr_info("hk: MQD updated  pgm=0x%08x_%02x\n", pgm_lo, pgm_hi);
 
-	/* 7. Write PM4 WRITE_DATA to ring — validates ring + doorbell (no shader) */
+	/* 7. Write NOP-only test first, then WRITE_DATA */
 	{
 		uint32_t *r, *w;
 		ret = amdgpu_bo_kmap(ring_mem->bo, (void **)&r); if (ret) goto out;
 		ret = amdgpu_bo_kmap(wptr_mem->bo, (void **)&w); if (ret) goto out;
 		wval = *w; idx = (wval / 4) % (RING_BYTES / 4);
 
-		/* PACKET3_RELEASE_MEM (0x3C): event-based write to memory */
-		/* Write timestamp/marker to result address */
-		r[idx + 0] = 0xc0000000U | (5 << 16) | (0x3C << 8);
-		r[idx + 1] = PACKET3_RELEASE_MEM_EVENT_TYPE(CACHE_FLUSH_AND_INV_TS) |
-			     PACKET3_RELEASE_MEM_EVENT_INDEX(5) |
-			     (1 << 26); /* DATA_SEL: send 64-bit data */
-		r[idx + 2] = (1 << 29) | (1 << 30); /* INT_SEL + DST_SEL = memory */
-		r[idx + 3] = HK_GPUVA_RESULT & 0xFFFFFFFF;
-		r[idx + 4] = (HK_GPUVA_RESULT >> 32) & 0xFFFFFFFF;
-		r[idx + 5] = 0x21544148; /* data lo */
-		r[idx + 6] = 0;          /* data hi */
+		/* Read rptr via BO CPU mapping */
+		uint32_t *rp;
+		uint32_t rptr_before = 0, rptr_after = 0;
+		if (amdgpu_bo_kmap(rptr_mem->bo, (void **)&rp) == 0)
+			rptr_before = *rp;
 
-		wval += 7 * 4; *w = wval;
+		/* Write NOP + wptr advance + doorbell ring */
+		r[idx + 0] = 0xc0001000U; /* NOP */
+		wval += 4; *w = wval;
+		writel(wval, adev->doorbell.cpu_addr + db_id);
+		msleep(50);
+		if (amdgpu_bo_kmap(rptr_mem->bo, (void **)&rp) == 0)
+			rptr_after = *rp;
 
-		db_id = q->doorbell_id;
-		if (adev->doorbell.cpu_addr) {
+		pr_info("hk: NOP test: wptr %u→%u  rptr %u→%u %s\n",
+			wval - 4, wval, rptr_before, rptr_after,
+			rptr_after > rptr_before ? "CP ALIVE!" : "(no change)");
+
+		if (rptr_after > rptr_before) {
+			/* CP is processing ring — try WRITE_DATA */
+			idx = (wval / 4) % (RING_BYTES / 4);
+			r[idx + 0] = 0xc0000000U | (3 << 16) | (0x37 << 8);
+			r[idx + 1] = HK_GPUVA_RESULT & 0xFFFFFFFF;
+			r[idx + 2] = (5 << 16) | (1 << 15) |
+				((HK_GPUVA_RESULT >> 32) & 0xFFFF);
+			r[idx + 3] = 0x21544148;
+			wval += 4 * 4; *w = wval;
 			writel(wval, adev->doorbell.cpu_addr + db_id);
-			pr_info("hk: WRITE_DATA doorbell RUNG  id=%d  wptr=0x%x\n", db_id, wval);
+			pr_info("hk: WRITE_DATA submitted wptr=0x%x\n", wval);
 		}
 	}
 

@@ -1,0 +1,101 @@
+These define "done" for the dev agent, ordered as a bring-up ladder. Assumed userspace API (thin libheteroken over clone3 + /dev/heteroken ioctls):
+
+'''
+/* libheteroken.h */
+#define CLONE_GCN  0x100000000ULL          /* clone3 flags extension */
+struct hk_gcn_entry {
+    int      code_fd;       /* GCN code object (.co, from clang --offload-arch=gfx902) */
+    const char *kernel;     /* symbol name */
+    void    *arg;           /* single pointer arg, visible at same VA (hUMA) */
+    uint32_t flags;
+};
+pid_t hk_spawn(const struct hk_gcn_entry *e, uint64_t clone_flags);
+
+/* clone_flags: CLONE_VM        -> "GPU pthread", shared address space
+ *              0 (fork-like)   -> CoW child address space
+ *              CLONE_VM|CLONE_VFORK -> vfork-like                       */
+'''
+Test 0 — Enumeration: the GPU appears as a node
+'''BASH
+$ cat /sys/devices/system/node/node1/heteroken/type
+GCN_CU
+$ cat /sys/devices/system/node/node1/heteroken/compute_units
+8                                  # 2200G: 8 CUs (Vega 8)
+$ cat /sys/devices/system/node/node1/heteroken/isa
+amdgcn-gfx902
+'''
+Pass: node visible; APU node reports 0 local memory; future dGPU reports VRAM size.
+
+Test 1 — Hello syscall: write(2) issued from a CU
+'''
+/* hello_gcn.c — GCN side, compiled to hello.co */
+__attribute__((hk_kernel))
+void gcn_main(void *arg) {
+    hk_syscall3(__NR_write, 1, (long)"hello from CU\n", 14); /* mailbox under the hood */
+    hk_syscall1(__NR_exit, 0);
+}
+'''
+'''
+/* host */
+pid_t pid = hk_spawn(&(struct hk_gcn_entry){ .code_fd = fd, .kernel = "gcn_main" },
+                     CLONE_VM);
+waitpid(pid, &st, 0);
+'''
+Pass: "hello from CU" on stdout; strace -p <pid> on the GCN task shows the write; cat /proc/<pid>/stat shows it; fd table and creds are the GCN task's own (verify by opening a file from GCN and checking /proc/<pid>/fd).
+
+Test 2 — fork semantics: CoW address space, same VAs
+'''
+char *buf = malloc(4096);
+strcpy(buf, "parent-data");
+pid_t pid = hk_spawn(&(struct hk_gcn_entry){ .code_fd=fd, .kernel="cow_child", .arg=buf },
+                     0 /* no CLONE_VM: fork-like CoW */);
+/* GCN child: asserts strcmp(arg,"parent-data")==0  (reads parent data, same VA),
+   then writes "child-data" into it, exits 0 */
+waitpid(pid, &st, 0);
+assert(!strcmp(buf, "parent-data"));   /* CoW: parent unaffected */
+'''
+Pass: child saw the data at the same virtual address; child's write did not leak to parent; with CLONE_VM instead, the write is visible. Verify via /proc/pid/pagemap that the page was duplicated on the GCN-triggered write fault.
+
+Test 3 — Mempolicy on the (future dGPU) node, no-op honesty on APU
+'''
+unsigned long mask = 1UL << gpu_node;
+set_mempolicy(MPOL_BIND, &mask, sizeof(mask)*8);
+void *p = mmap(NULL, 64<<20, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0);
+memset(p, 1, 64<<20);
+/* check /proc/self/numa_maps: pages on gpu_node (dGPU); on APU, documented EINVAL or node0 */
+'''
+Pass (dGPU phase): pages on the GPU node; a GCN task with MPOL_LOCAL allocates there by default. Pass (APU phase): documented, deterministic behavior — not a silent lie.
+
+Test 4 — Signals: a spinning GCN task is killable
+'''
+pid_t pid = hk_spawn(&entry_spin_forever, CLONE_VM);
+sleep(1);
+kill(pid, SIGTERM);                     /* default disposition */
+assert(waitpid(pid, &st, 0) == pid && WTERMSIG(st) == SIGTERM);
+'''
+Pass: task dies < 100 ms via CWSR queue preempt; CUs are reclaimed (re-spawn succeeds); a GCN null-pointer store yields SIGSEGV attributed to the right PID with si_addr set. This test is exactly what GFX7 could never pass — make it the smoke test on the 2200G.
+
+Test 5 — IPC across the ISA boundary: pipe + futex
+'''
+/* CPU producer writes 1MB into pipe; GCN consumer read()s and checksums.
+   Then: shared futex word — GCN does FUTEX_WAIT, CPU does FUTEX_WAKE. */
+'''
+Pass: checksum matches; GCN futex waiter wakes (proves the mailbox path composes with sleeping syscalls, not just instant ones).
+
+Test 6 — The actual point: heterogeneous fan-out
+'''
+/* saxpy: parent x86 process forks N GCN tasks + M CPU tasks over one array */
+for (int i = 0; i < n_gcn; i++)
+    hk_spawn(&(struct hk_gcn_entry){.code_fd=fd, .kernel="saxpy_chunk",
+                                    .arg=&chunks[i]}, CLONE_VM);
+for (int i = 0; i < n_cpu; i++)
+    if (!fork()) { saxpy_chunk_x86(&chunks[n_gcn+i]); _exit(0); }
+while (wait(NULL) > 0) ;
+verify(y);
+'''
+Pass: correct result; top shows GCN tasks; GCN chunks beat one CPU core on FP32 throughput (sanity, not benchmark).
+
+Test 7 — Negative tests (define the ISA wall)
+execve() from a GCN task: must either transparently continue as x86 (acceptable) or fail with documented errno — never wedge.
+Host x86 function pointer passed as kernel entry: spawn fails cleanly (-ENOEXEC), no GPU hang, machine survives.
+1000 sequential spawn/exit cycles: no CU/queue/doorbell leak (compute_units and KFD queue counts return to baseline).

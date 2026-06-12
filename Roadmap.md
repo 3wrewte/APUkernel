@@ -17,6 +17,25 @@ Transform AMD A8-7500 APU into a heterogeneous system where:
 
 | Component | Detail |
 |-----------|--------|
+| ~~APU~~ | ~~AMD A8-7500 (Kaveri, FM2+)~~ — **RETIRED** (CIK lacks MEC firmware) |
+| Next APU | AMD Raven Ridge / Picasso / Renoir (GFX9+, Vega, AM4) |
+| CPU cores | 4x x86 (Zen/Zen+) |
+| GPU cores | 8-11 CUs (Vega, GFX9) |
+| Key features | SVM (Shared Virtual Memory), MEC (AQL dispatch), XNACK, full ROCm |
+| Memory model | hUMA — single unified physical address space |
+| Kernel driver | amdkfd (upstream Linux 6.x) |
+
+**Migration rationale**: GFX7 (CIK) cannot dispatch user shaders to user-mode
+compute queues — the CP firmware lacks MEC, and KFD does not set `compute_pgm`
+in the MQD. GFX9+ has MEC firmware that natively handles AQL dispatch.
+See `docs/cik-lessons.md` for full analysis. The entire kernel module
+infrastructure (queue creation, GPU memory, doorbell) ports directly to GFX9+
+with minimal changes.
+
+### Original Target (Retained for reference)
+
+| Component | Detail |
+|-----------|--------|
 | APU | AMD A8-7500 (Kaveri, FM2+) |
 | CPU cores | 4x x86 Steamroller |
 | GPU cores | 6x GCN 1.1 Compute Units (Radeon R7, 384 shaders) |
@@ -459,5 +478,9 @@ APUkernel/
 | 2026-06-05 | H | sysfs /sys/kernel/heteroken/run trigger — no boot blocking | ✅ |
 | 2026-06-05 | H | Full pipeline works: process→VM→bind→alloc×7→queue→MQD→descriptor→dispatch | ✅ |
 | 2026-06-05 | H | AQL dispatch: doorbell rings, ring processed, kernel doesn't execute (CIK descriptor issue) | 🔧 |
+| 2026-06-05 | H | **Root cause**: CIK has no MEC firmware; user-mode PM4/AQL dispatch non-viable | 🔧 |
+| 2026-06-05 | — | **Decision**: Migrate to GFX9+ APU (Raven Ridge / Picasso / Renoir) | 🔄 |
 | 2026-06-05 | — | kernel-patches/: git-tracked heteroken.c + amdkfd-makefile.patch | ✅ |
 | 2026-06-05 | — | scripts/: apply-kernel-patch.sh, build-kernel.sh, kernel-test.sh | ✅ |
+| 2026-06-05 | — | docs/cik-lessons.md: CIK dispatch analysis + migration plan | ✅ |
+| 2026-06-05 | — | tmp/state.md: current machine state + handoff notes | ✅ |
