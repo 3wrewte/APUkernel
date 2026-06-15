@@ -244,34 +244,31 @@ Kaveri firmware only. amdgpu fails to load `raven_gpu_info.bin` during early
 boot (before rootfs is mounted). Fix requires either building Raven firmware
 into the kernel image, or serving an initramfs with firmware files.
 
-### Phase 1: AQL Dispatch End-to-End [ONLINE — 3-5 days] 🎯 FIRST MILESTONE
+### Phase 1: AQL Dispatch End-to-End [ONLINE — 3-5 days] 🎯 FIRST MILESTONE — ACHIEVED 2026-06-15
 
-This is the old "Phase H" reborn on GFX9 — prove that we can dispatch a GCN
-wavefront and read a result back.
+**Milestone met**: GCN wavefront wrote magic value 0x21544148 to GPU memory,
+read back by CPU via kernel compute ring + IB dispatch.
+
+**Actual dispatch mechanism** (different from original plan):
+- Kernel compute ring (`adev->gfx.compute_ring[0]`) + IB (Indirect Buffer)
+- Uses `PACKET3()` (not `PACKET3_COMPUTE()`), VMID 0
+- Shader code and result buffer placed in IB data area
+- `amdgpu_ib_schedule()` + `dma_fence_wait_timeout()` for dispatch + completion
+
+**KFD queue path** (attempted but SPI never created waves):
+- KFD PM4-format queue: CP processed DISPATCH_DIRECT, all regs correct, but
+  `SPI_CSQ_WF_ACTIVE_COUNT_0=0` — MEC firmware apparently requires KIQ
+  MAP_QUEUES before forwarding dispatches to SPI.
 
 | # | Task | Verification |
 |---|------|-------------|
-| 1.1 | Adapt `heteroken.c` for GFX9: queue format AQL (`KFD_QUEUE_FORMAT_AQL`), not PM4 | Compiles in-tree |
-| 1.2 | Remove all CIK-specific code: PM4 packets, MQD manual register writes, INDIRECT_BUFFER | Code clean |
-| 1.3 | GPU memory allocation: SVM means `va_addr=0` works (no explicit GPU VA needed) | Allocation succeeds |
-| 1.4 | AQL dispatch packet: `hsa_kernel_dispatch_packet_t` with `kernel_object` pointer → MEC loads shader | Wavefront executes |
-| 1.5 | Rebuild `hello_gcn` targeting `gfx902` instead of `gfx700` | `llvm-objdump` shows GFX9 ISA |
-| 1.6 | Full pipeline: process → VM → bind → alloc → queue → AQL dispatch → result read | Magic value read back from GPU memory |
-| 1.7 | Doorbell via `adev->doorbell.cpu_addr` (unchanged from CIK work) | Reliable doorbell ring |
-
-**What ports directly from CIK work** (steps 1-8 of `heteroken.c`):
-- Process creation, VM init, device binding
-- GPU buffer allocation + mapping (simplified: no explicit GPU VA)
-- Queue creation (`pqm_create_queue`)
-- Doorbell access
-- sysfs trigger interface
-- Kernel descriptor construction
-
-**What is new on GFX9**:
-- Queue format: `KFD_QUEUE_FORMAT_AQL` instead of `KFD_QUEUE_FORMAT_PM4`
-- Dispatch: AQL packet instead of PM4 `DISPATCH_DIRECT`
-- No MQD manual register manipulation (MEC reads descriptor directly)
-- SVM eliminates explicit GPU VA management
+| 1.1 | Adapt `heteroken.c` for GFX9: in-tree build, PM4 format queue | Compiles + boots |
+| 1.2 | GPU memory allocation: KFD gpuvm buffers at explicit GPU VAs | Allocation + mapping succeeds ✅ |
+| 1.3 | PM4 command stream: SET_SH_REG + DISPATCH_DIRECT via KFD queue | CP processes all packets, rptr=WPTR ✅ |
+| 1.4 | Rebuild `hello_gcn` targeting `gfx902` | `llvm-objdump` confirms GFX9 ISA ✅ |
+| 1.5 | Kernel compute ring IB dispatch — shader executes, result verified | **result=0x21544148 MAGIC MATCH** ✅ |
+| 1.6 | KFD queue path blocked: SPI never creates waves. Future work: add KIQ MAP_QUEUES | 🔧 |
+| 1.7 | Clean up heteroken.c, remove dead KFD queue code | Pending |
 
 ### Phase 2: Mailbox + IH Interrupt Path [ONLINE — 4-6 days]
 
@@ -547,3 +544,18 @@ APUkernel/
 | 2026-06-12 | — | **Architecture redesigned**: GCN task model — real task_struct, unmodified scheduler/handlers | ✅ |
 | 2026-06-12 | 0 | 2200G boots PXE, but amdgpu init fails: missing Raven firmware in CONFIG_EXTRA_FIRMWARE | 🔧 |
 | 2026-06-12 | — | Roadmap rewritten for new platform + new architecture | ✅ |
+| 2026-06-14 | 1 | Phase 1 begin: KFD queue + PM4 dispatch on GFX9 | ✅ |
+| 2026-06-14 | 1 | kfd_queue_acquire_buffers CWSR size mismatch fixed (exact size required) | ✅ |
+| 2026-06-14 | 1 | NO_HWS mode (sched_policy=2) for explicit VMID allocation. VMID=8 assigned | ✅ |
+| 2026-06-14 | 1 | PM4 NOP dispatch: CP processes packet, rptr advances — CP ALIVE! | ✅ |
+| 2026-06-14 | 1 | PM4 SET_SH_REG works: all compute registers programmed, confirmed by readback | ✅ |
+| 2026-06-14 | 1 | PACKET3_COMPUTE format bugs fixed: opcode at bits[15:8], n = data_words-1 | ✅ |
+| 2026-06-14 | 1 | COMPUTE_VMID must be set explicitly (CP doesn't inherit from queue VMID) | ✅ |
+| 2026-06-14 | 1 | AQL queue format tested: WPTR stuck at 0 (rptr never advances). Switched to PM4 | ✅ |
+| 2026-06-15 | 1 | gfx902 hello_gcn.hsaco built on dev machine (clang + ld.lld), encoding verified | ✅ |
+| 2026-06-15 | 1 | gfx902 shader embedded in heteroken.c: 8-dword direct shader (no kernarg indirection) | ✅ |
+| 2026-06-15 | 1 | **KFD queue dispatch blocked**: SPI never creates waves despite correct regs. SPI_CSQ_WF_ACTIVE=0 | 🔧 |
+| 2026-06-15 | 2 | **Phase 2 mailbox + IH interrupt path complete!** callback fires in IRQ context | ✅ |
+| 2026-06-15 | 2 | Mailbox shader: 26-dword gfx902 code, writes 5 structured fields to mailbox BO | ✅ |
+| 2026-06-15 | 2 | `amdgpu_bo_create_kernel()`: persistent mailbox BO survives IB lifetime | ✅ |
+| 2026-06-15 | 2 | `dma_fence_add_callback()`: IH interrupt fires callback in IRQ context, reads mailbox | ✅ |

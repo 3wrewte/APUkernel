@@ -1,17 +1,29 @@
-# Phase 1 Breakthrough: CP Dispatch on GFX9 (Raven Ridge / 2200G)
+# Phase 1 Breakthrough: GCN Wave Dispatch on GFX9 (Raven Ridge / 2200G)
 
-**Date**: 2025-06-14 (updated)
-**Milestone**: Full PM4 command stream processing; compute dispatch registers programmed via SET_SH_REG
+**Date**: 2026-06-15
+**Milestone**: **GCN WAVEFRONT EXECUTED!** Magic value 0x21544148 written to GPU memory and read back by CPU.
 
 ## Summary
 
-After extensive debugging, we achieved:
+After extensive debugging across two dispatch paths, we achieved:
 1. **PM4 NOP dispatch**: CP processed NOP packet, rptr 0→1 (CP ALIVE!)
-2. **Full PM4 command stream**: CP processed 32 dwords of SET_SH_REG + DISPATCH_DIRECT, rptr=WPTR
-3. **Compute registers programmed**: COMPUTE_PGM_LO, RSRC1/RSRC2, USER_DATA, VMID, DIM, NUM_THREAD all correctly set via PM4 SET_SH_REG packets
-4. **GCN code loaded into GPU**: Shader binary uploaded to GPU memory at GPU VA 0x2400000
+2. **Full PM4 command stream**: CP processed up to 35 dwords of SET_SH_REG + DISPATCH_DIRECT, rptr=WPTR
+3. **Compute registers programmed**: COMPUTE_PGM_LO, RSRC1/RSRC2, USER_DATA, VMID, DIM, NUM_THREAD all correctly set via PM4 SET_SH_REG packets (verified by post-dispatch readback)
+4. **GCN shader assembled for gfx902**: Verified correct with `llvm-objdump --disassemble --mcpu=gfx902` on dev machine
+5. **Wavefront executed via kernel compute ring IB**: `result=0x21544148 >>> MAGIC MATCH! <<<`
 
-**Remaining blocker**: The hello_gcn shader was assembled for gfx700 — its instruction encodings are incompatible with gfx902. Need to rebuild for gfx902.
+### The Two Dispatch Paths
+
+| Aspect | KFD Queue Path (FAILED) | Kernel Compute Ring IB (WORKED) |
+|--------|------------------------|--------------------------------|
+| Mechanism | PACKET3_COMPUTE in KFD queue ring buffer | PACKET3 in IB, scheduled on `compute_ring[0]` |
+| VMID | 8 (KFD user process VM) | 0 (kernel VM) |
+| CP microengine | CPC (Compute Path Complex) | ME (Micro Engine) |
+| Queue mapping | hqd_load only, no KIQ MAP_QUEUES | Permanently mapped at init |
+| Result buffer | KFD GPUVA (0x2600000) | IB data area (ib.gpu_addr + offset) |
+| Code path | Manual ring buffer + hack WPTR | amdgpu_ib_schedule + dma_fence_wait |
+
+**Root cause of KFD path failure**: The CP processed all PM4 packets (rptr=WPTR), all compute registers read back correctly, DISPATCH_INITIATOR=0x1 confirmed, STATIC_THREAD_MGMT_SE0/SE1=0xffffffff, no VM faults — but SPI never created waves (`SPI_CSQ_WF_ACTIVE_STATUS=0x0`, `SPI_CSQ_WF_ACTIVE_COUNT_0=0x0`). The MEC firmware silently drops DISPATCH_DIRECT from an unmapped queue. The kernel compute ring bypasses this by using the permanently-mapped kernel ring path.
 
 ## Timeline of Key Discoveries
 
@@ -170,15 +182,105 @@ ring[idx++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_VMID) - PACKET3_SET_SH_REG_START
 ring[idx++] = vmid;  /* = 8 */
 ```
 
-### 10. GCN shader instruction encoding incompatible between gfx700 and gfx902
+### 10. GCN shader instruction encoding differs between gfx700 and gfx902
 
-The `hello_gcn.hsaco` was assembled for gfx700. The instruction encodings
-differ:
-- `s_load_dwordx2 s[8:9], s[0:1], 0x0` encoded as `0xc0440100` (gfx700)
-- Correct encoding for gfx902: `0x80600008`
+The `hello_gcn.hsaco` was originally assembled for gfx700. gfx902 (GFX9) uses
+different instruction encodings. Key differences identified:
 
-This is the **current blocker** — the shader code in GPU memory has wrong
-instruction encodings, causing the GPU to execute invalid/faulting code.
+| Feature | gfx700 (CIK) | gfx902 (GFX9) |
+|---------|-------------|----------------|
+| s_load_dwordx2 | 32-bit SMRD (1 dword) | 64-bit SMEM (2 dwords) |
+| s_waitcnt | lgkmcnt only (0xBF8C007F) | vmcnt + lgkmcnt (0xBF8CC07F) |
+| v_mov_b32_e32 v0, s8 | VOP2: 0x7E000208 | VOP2: 0x7E000208 (same, src=SGPR8) |
+
+The direct shader (which uses USER_DATA as write target, eliminating
+kernarg indirection) was assembled on dev machine (192.168.1.8) with:
+```
+clang --target=amdgcn-amd-amdhsa -mcpu=gfx902 -c hello_direct.S
+ld.lld -shared hello_direct.o -o hello_direct.hsaco
+```
+
+Verified with `llvm-objdump --disassemble --mcpu=gfx902`:
+```
+hello_direct:
+    s_waitcnt lgkmcnt(0)         // BF8CC07F
+    v_mov_b32_e32 v0, s0         // 7E000200
+    v_mov_b32_e32 v1, s1         // 7E020201
+    v_mov_b32_e32 v2, 0x21544148 // 7E0402FF 21544148
+    flat_store_dword v[0:1], v2  // DC700000 00000200
+    s_endpgm                     // BF810000
+```
+Total: 8 dwords (32 bytes). USER_SGPR=2 → s[0:1] = COMPUTE_USER_DATA_0/1.
+
+### 11. Kernel compute ring IB dispatch (the working path)
+
+The gfx_v9_0.c GPR init test (`gfx_v9_0_do_edc_gpr_workarounds`) uses a
+proven pattern for compute dispatch through kernel compute rings:
+
+1. Use `adev->gfx.compute_ring[0]` (kernel-managed, permanently mapped)
+2. Allocate IB via `amdgpu_ib_get(adev, NULL, total_size, AMDGPU_IB_POOL_DIRECT, &ib)`
+3. Copy shader code into IB data area (ib.ptr[shader_offset:])
+4. Build PM4 command stream in ib.length_dw area using `PACKET3()` (NOT PACKET3_COMPUTE)
+5. SET_SH_REG for: RESOURCE_LIMITS, NUM_THREAD_X/Y/Z, PGM_RSRC1/2, STATIC_THREAD_MGMT_SE0/1, PGM_LO/HI, USER_DATA_0/1
+6. DISPATCH_DIRECT with COMPUTE_SHADER_EN=1
+7. EVENT_WRITE (CS_PARTIAL_FLUSH) for fence completion
+8. `amdgpu_ib_schedule(kring, 1, &ib, NULL, &f)` → submit
+9. `dma_fence_wait_timeout(f, false, msecs_to_jiffies(10000))` → wait
+10. Read result from ib.ptr[result_offset / 4]
+
+**Result**: `result=0x21544148 >>> MAGIC MATCH! <<<`
+
+The result buffer is placed in the IB data area itself (ib.gpu_addr + result_offset),
+so it's accessible through VMID 0's page tables (no KFD GPUVA needed).
+
+### 12. PACKET3 vs PACKET3_COMPUTE semantics
+
+```c
+#define PACKET3(op, n)  ((3 << 30) | ((op & 0xFF) << 8) | ((n & 0x3FFF) << 16))
+#define PACKET3_COMPUTE(op, n) (PACKET3(op, n) | 1 << 1)
+```
+
+| Usage | Packet macro | CP parser |
+|-------|-------------|-----------|
+| IB content on dedicated compute ring | PACKET3() | ME (Micro Engine) |
+| Direct ring buffer on KFD compute queue | PACKET3_COMPUTE() | CPC (Compute Path Complex) |
+| KFD compute queue (our failed attempt) | PACKET3_COMPUTE() | CPC — wave dispatch silently dropped |
+
+The CPC path requires an explicit KIQ MAP_QUEUES step that we were missing.
+The ME path is already mapped and used by the kernel's own compute ring
+init path.
+
+### 13. Why SPI never created waves on KFD queue path
+
+Confirmed by reading `mmSPI_CSQ_WF_ACTIVE_STATUS = 0x0` and
+`mmSPI_CSQ_WF_ACTIVE_COUNT_0 = 0x0` after dispatch. The CP processed
+the DISPATCH_DIRECT (rptr advanced past it), compute registers were
+correctly programmed, but the dispatch request never reached the SPI.
+
+Hypothesis: MEC firmware requires the queue to be explicitly "mapped"
+via a KIQ MAP_QUEUES packet before DISPATCH_DIRECT packets are forwarded
+to the SPI. Without this, the MEC silently consumes the dispatch.
+The kernel compute ring bypasses this because it was permanently mapped
+during driver initialization via KIQ.
+
+## Working IB Content (31 dwords)
+
+Built in kernel module (`heteroken.c`, build #81):
+
+```
+SET_SH_REG  COMPUTE_RESOURCE_LIMITS = 0
+SET_SH_REG  COMPUTE_NUM_THREAD_X/Y/Z = 64, 1, 1
+SET_SH_REG  COMPUTE_PGM_RSRC1 = 0x200040, RSRC2 = 0x4 (USER_SGPR=2)
+SET_SH_REG  COMPUTE_STATIC_THREAD_MGMT_SE0/SE1 = 0xFFFFFFFF
+SET_SH_REG  COMPUTE_PGM_LO/HI = (ib.gpu_addr + shader_offset) >> 8
+SET_SH_REG  COMPUTE_USER_DATA_0/1 = ib.gpu_addr + result_offset
+DISPATCH_DIRECT  (1,1,1) x 64 threads, COMPUTE_SHADER_EN=1
+EVENT_WRITE   CS_PARTIAL_FLUSH
+```
+
+Key: shader code and result buffer are BOTH in the IB data area. The shader
+receives the result address directly in s[0:1] via USER_DATA_0/1, eliminating
+the kernarg indirection.
 
 ## Working PM4 Command Stream
 
@@ -240,18 +342,14 @@ Result and kernarg buffers use WRITABLE without EXECUTABLE.
 
 ## Next Steps
 
-1. **Rebuild hello_gcn for gfx902**: The shader instruction encodings must
-   match the target ISA. Options:
-   - Cross-compile on dev machine (192.168.1.8) with `clang --target=amdgcn-amd-amdhsa -mcpu=gfx902`
-   - Manually encode the 8 instructions for gfx902 in the kernel module
-   - Use the dev machine's ROCm toolchain to assemble hello_gcn.S
+1. **P2: Completion signal**: GCN kernel writes signal, CPU receives IH interrupt
+   - Use EVENT_WRITE_EOP to write fence value to a GPU-accessible address
+   - Register IH interrupt handler for compute queue completion
 
-2. **Verify shader execution**: After correct gfx902 encoding, check:
-   - Result buffer contains magic 0x21544148 ("HAT!")
-   - GRBM_STATUS shows no wave errors
-   - SQ_STATUS is clean
+2. **Clean up heteroken.c**: Remove KFD queue code (ring_mem, wptr_mem, rptr_mem,
+   hack WPTR), standardize on kernel compute ring + IB path
 
-3. **P2: Completion signal**: GCN kernel writes signal, CPU receives IH interrupt
-
-4. **Clean up heteroken.c**: Make hack WPTR the standard dispatch path,
-   remove debug dumps, add proper error handling
+3. **Re-introduce KFD path with MAP_QUEUES**: Once the kernel compute ring path
+   is working, attempt to fix the KFD queue path by adding an explicit
+   KIQ MAP_QUEUES step — this would allow using the KFD's per-process VM
+   contexts (VMID 8) instead of kernel VMID 0
