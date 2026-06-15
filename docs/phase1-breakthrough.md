@@ -340,16 +340,124 @@ All buffers allocated via `amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu()` with
 GTT + WRITABLE + PUBLIC flags. Code buffer also has EXECUTABLE flag.
 Result and kernarg buffers use WRITABLE without EXECUTABLE.
 
+## Phase 2: Mailbox Protocol + IH Interrupt Path (2026-06-15)
+
+### 14. Mailbox shader for gfx902 (26 dwords)
+
+A new shader `hello_mailbox.S` writes 5 structured dwords sequentially:
+```
+s_waitcnt lgkmcnt(0)                    // BF8CC07F
+v_mov_b32_e32 v0, s0; v1, s1           // v[0:1] = mailbox GPU VA
+v_mov_b32_e32 v2, 0x21544148            // magic → mailbox[0]
+flat_store_dword; v_add_u32_e32 v0, 4   // v0 += 4
+v_mov_b32 v2, 1; flat_store             // state=1 → mailbox[4]
+v_mov_b32 v2, 42; flat_store            // syscall=42 → mailbox[8]
+v_mov_b32 v2, 0xDEADBEEF; flat_store   // arg0 → mailbox[12]
+v_mov_b32 v2, 0xCAFEBABE; flat_store   // arg1 → mailbox[16]
+s_endpgm
+```
+
+Key encoding: `v_add_u32_e32 v0, 4, v0` = `0x68000084` (VOP2, inline constant 4).
+Built on dev machine, `llvm-objdump` verified.
+
+### 15. Persistent mailbox BO
+
+`amdgpu_bo_create_kernel(adev, size, PAGE_SIZE, AMDGPU_GEM_DOMAIN_GTT, ...)`
+allocates a GTT BO accessible from both CPU (via `mb_cpu` pointer) and GPU
+(via `mb_gpu_addr` passed as COMPUTE_USER_DATA_0/1). This BO survives IB
+lifetime — critical for async dispatch where IB is freed before result read.
+
+### 16. IH interrupt-driven completion
+
+Replaced `dma_fence_wait_timeout()` (polling) with `dma_fence_add_callback()`:
+```
+amdgpu_ib_schedule → fence created
+dma_fence_add_callback(fence, &cb, hk_fence_callback)
+  → callback fires from IRQ context when IB completes
+  → callback reads mailbox, calls complete()
+wait_for_completion()   // blocks until IRQ fires
+```
+
+Verified: callback runs in **IRQ context** (`in_irq() == true`), confirming
+the full GPU→CPU interrupt path: GCN wavefront → EVENT_WRITE → IH → fence
+handler → our callback.
+
+## Phase 3: GCN Task Lifecycle (2026-06-16)
+
+### 17. GCN task context (`struct hk_gcn_ctx`)
+
+Per-task GPU execution context:
+```c
+struct hk_gcn_ctx {
+    struct amdgpu_device *adev;
+    struct amdgpu_bo     *mb_bo;        // persistent mailbox
+    void                 *mb_cpu;        // CPU mapping
+    u64                   mb_gpu_addr;   // GPU VA for shader
+    struct task_struct    *task;          // owning task
+    struct dma_fence_cb   fence_cb;      // IH → wake_up_process
+    struct dma_fence     *fence;
+};
+```
+
+### 18. Sleep/wake dispatch (`hk_dispatch_ctx`)
+
+Replaces polling `wait_for_completion()` with task sleep:
+```
+set_current_state(TASK_UNINTERRUPTIBLE)
+hk_dispatch_ctx(ctx, shader, size)
+  → amdgpu_ib_schedule → dma_fence_add_callback(fence, &ctx->fence_cb, hk_gcn_wakeup)
+  → schedule()           // task sleeps
+  // ... GPU executes ...
+  // IH IRQ → hk_gcn_wakeup → wake_up_process(ctx->task)
+  // task resumes after schedule()
+__set_current_state(TASK_RUNNING)
+// read mailbox on CPU
+```
+
+This is the core GCN task lifecycle pattern — same as what clone3(CLONE_GCN)
+will use, just with a kthread instead of a user task.
+
+### 19. GCN kthread demo
+
+`/sys/kernel/heteroken/spawn` — creates kthread `hk-gcn-0 [737]`
+`/sys/kernel/heteroken/stop`  — wakes thread + kthread_stop() + cleanup
+
+Thread lifecycle (verified 50+ iterations):
+```
+hk-gcn-0 [737] born
+  loop:
+    hk-gcn-0 [737] → GPU (sleep)
+    *** IH → wake hk-gcn-0 [737] (IRQ context: yes) ***
+    hk-gcn-0 [737] ← GPU (wake)
+    GCN task mailbox: magic=0x21544148 state=1 syscall=42 args=[0xdeadbeef,0xcafebabe]
+    GCN task would execute syscall 42
+  stopping GCN task hk-gcn-0 [737]
+  hk-gcn-0 [737] exiting
+  GCN task stopped
+```
+
+Each iteration: ~12ms (IB submit → IH wake). Mailbox data correct every time.
+
+## Current Architecture (Phase 3)
+
+```
+heteroken.c  (in-tree, drivers/gpu/drm/amd/amdkfd/)
+├── Device discovery: hk_get_adev() — open /dev/kfd, find PDD, return adev
+├── Dispatch layer:  hk_dispatch_ctx() — kernel compute ring + IB + fence callback
+│   └── (swappable → KFD queue when MAP_QUEUES is solved)
+├── GCN task life:   hk_gcn_thread() — sleep → GPU → IH → wake → CPU → repeat
+├── Sync dispatch:   run_store — dma_fence_wait_timeout (P2 compat)
+└── sysfs:           spawn / stop nodes for kthread management
+```
+
 ## Next Steps
 
-1. **P2: Completion signal**: GCN kernel writes signal, CPU receives IH interrupt
-   - Use EVENT_WRITE_EOP to write fence value to a GPU-accessible address
-   - Register IH interrupt handler for compute queue completion
+1. **P3b: clone3 hook** — add `CLONE_GCN` flag to `include/uapi/linux/sched.h`,
+   hook `kernel/fork.c:copy_process()`, register `hk_clone_gcn_callback` from
+   heteroken module. The kthread lifecycle already proves the pattern works.
 
-2. **Clean up heteroken.c**: Remove KFD queue code (ring_mem, wptr_mem, rptr_mem,
-   hack WPTR), standardize on kernel compute ring + IB path
+2. **P4: CoW semantics** — verify that GCN task with dup'd mm triggers
+   IOMMUv2 PPR on GPU page fault, `handle_mm_fault()` resolves it.
 
-3. **Re-introduce KFD path with MAP_QUEUES**: Once the kernel compute ring path
-   is working, attempt to fix the KFD queue path by adding an explicit
-   KIQ MAP_QUEUES step — this would allow using the KFD's per-process VM
-   contexts (VMID 8) instead of kernel VMID 0
+3. **P2b: KIQ MAP_QUEUES** — revisit KFD queue path by adding explicit
+   KIQ MAP_QUEUES step, enabling per-process VMID (8) dispatch.

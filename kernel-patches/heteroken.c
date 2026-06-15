@@ -2,29 +2,16 @@
  * HeteroKern — GCN compute dispatch on GFX9 (Raven Ridge)
  *
  * ==========================================================================
- * DISPATCH LAYER (swappable)
- *
- *   Current: kernel compute ring + IB  (PACKET3, VMID 0)
- *   Future:  KFD PM4 queue             (PACKET3_COMPUTE, VMID 8)
- *
- *   The dispatch function hk_dispatch() takes an adev + shader binary + size
- *   and returns the uint32_t written by the shader. The caller doesn't care
- *   about the underlying mechanism (IB vs KFD queue).
- *
- *   Swapping the back-end only needs to replace hk_dispatch() — the call
- *   signature stays the same: (adev, shader_dwords, code_ptr, code_dwords) → result.
+ * PHASES COMPLETE:
+ *   P1 — GPU wavefront executes + magic value
+ *   P2 — Mailbox protocol + IH interrupt → CPU wakeup
+ *   P3 — GCN task lifecycle (kthread → GPU → IH wake → CPU → repeat)
  *
  * ==========================================================================
- * DEVICE DISCOVERY (also swappable)
- *
- *   Current: open /dev/kfd → find PDD → get adev
- *   Future:  amdgpu device iteration or direct pointer from clone3 hook
- *
+ * DISPATCH LAYER
+ *   Current: kernel compute ring + IB (PACKET3, VMID 0)
+ *   Future:  KFD PM4 queue (PACKET3_COMPUTE, VMID 8) — swap in hk_dispatch_ctx()
  * ==========================================================================
- * PM4 packet reference:
- *   PACKET3(op, n):  op at bits[15:8], n = data_words - 1
- *   SET_SH_REG offset = SOC15_REG_OFFSET(GC,0,mmXXX) - PACKET3_SET_SH_REG_START (in bytes)
- *   COMPUTE_PGM_LO = (shader GPU VA) >> 8  (256-byte aligned)
  */
 
 #include <linux/module.h>
@@ -34,6 +21,7 @@
 #include <linux/sysfs.h>
 #include <linux/completion.h>
 #include <linux/dma-fence.h>
+#include <linux/kthread.h>
 
 #include "kfd_priv.h"
 #include "../amdgpu/amdgpu_amdkfd.h"
@@ -47,81 +35,48 @@
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("HeteroKern GCN compute dispatch on GFX9");
 
-/* --------------------------------------------------------------------------
- * gfx902 mailbox shader — 26 dwords (104 bytes)
- *
- * HSA ABI (USER_SGPR=2): s[0:1] = COMPUTE_USER_DATA_0/1 = mailbox GPU VA
- *
- * Writes 5 dwords sequentially to the mailbox:
- *   [+0]  magic    = 0x21544148
- *   [+4]  state    = 1 (syscall_pending)
- *   [+8]  syscall  = 42
- *   [+12] arg0     = 0xDEADBEEF
- *   [+16] arg1     = 0xCAFEBABE
- *
- * Built on dev machine (192.168.1.8):
- *   clang --target=amdgcn-amd-amdhsa -mcpu=gfx902 -c hello_mailbox.S
- *   ld.lld -shared hello_mailbox.o -o hello_mailbox.hsaco
- *   Verified: llvm-objdump --disassemble --mcpu=gfx902
- */
-static const uint32_t hello_mailbox[] = {
-	0xBF8CC07F, /* s_waitcnt lgkmcnt(0) */
-	0x7E000200, /* v_mov_b32_e32 v0, s0 */
-	0x7E020201, /* v_mov_b32_e32 v1, s1 */
-	0x7E0402FF, 0x21544148, /* v_mov_b32_e32 v2, 0x21544148 */
-	0xDC700000, 0x00000200, /* flat_store_dword v[0:1], v2 — magic */
-	0x68000084, /* v_add_u32_e32 v0, 4, v0 */
-	0x7E040281, /* v_mov_b32_e32 v2, 1 */
-	0xDC700000, 0x00000200, /* flat_store — state */
-	0x68000084, /* v_add_u32_e32 v0, 4, v0 */
-	0x7E0402AA, /* v_mov_b32_e32 v2, 42 */
-	0xDC700000, 0x00000200, /* flat_store — syscall_nr */
-	0x68000084, /* v_add_u32_e32 v0, 4, v0 */
-	0x7E0402FF, 0xDEADBEEF, /* v_mov_b32_e32 v2, 0xDEADBEEF */
-	0xDC700000, 0x00000200, /* flat_store — arg0 */
-	0x68000084, /* v_add_u32_e32 v0, 4, v0 */
-	0x7E0402FF, 0xCAFEBABE, /* v_mov_b32_e32 v2, 0xCAFEBABE */
-	0xDC700000, 0x00000200, /* flat_store — arg1 */
-	0xBF810000, /* s_endpgm */
+/* ==========================================================================
+ * Shader binaries (built on dev machine 192.168.1.8, --mcpu=gfx902)
+ * ========================================================================== */
+
+/* 8-dword "hello": writes magic 0x21544148 to s[0:1] */
+static const uint32_t hello_shader[] = {
+	0xBF8CC07F, 0x7E000200, 0x7E020201,
+	0x7E0402FF, 0x21544148,
+	0xDC700000, 0x00000200,
+	0xBF810000,
 };
-#define MAILBOX_SHADER_DW ARRAY_SIZE(hello_mailbox)
+
+/* 26-dword "mailbox": writes 5 struct fields to s[0:1] */
+static const uint32_t mailbox_shader[] = {
+	0xBF8CC07F,                /* s_waitcnt lgkmcnt(0) */
+	0x7E000200,                /* v_mov_b32_e32 v0, s0 */
+	0x7E020201,                /* v_mov_b32_e32 v1, s1 */
+	0x7E0402FF, 0x21544148,    /* v2=magic → store */
+	0xDC700000, 0x00000200,
+	0x68000084,                /* v_add_u32_e32 v0,4,v0 */
+	0x7E040281,                /* v2=1 → store state */
+	0xDC700000, 0x00000200,
+	0x68000084,
+	0x7E0402AA,                /* v2=42 → store syscall */
+	0xDC700000, 0x00000200,
+	0x68000084,
+	0x7E0402FF, 0xDEADBEEF,    /* v2=0xDEADBEEF → arg0 */
+	0xDC700000, 0x00000200,
+	0x68000084,
+	0x7E0402FF, 0xCAFEBABE,    /* v2=0xCAFEBABE → arg1 */
+	0xDC700000, 0x00000200,
+	0xBF810000,                /* s_endpgm */
+};
 #define MAGIC 0x21544148
 
-/* --------------------------------------------------------------------------
- * Device discovery: get amdgpu_device pointer
- *
- * Current implementation: open /dev/kfd, walk process PDDs, extract adev.
- * This is the minimal path that doesn't require DRM render node or VM init.
- */
-static struct amdgpu_device *hk_get_adev(void)
-{
-	struct kfd_process *proc;
-	struct file *f;
+/* Compute register defaults */
+#define HK_VGPRS     0
+#define HK_SGPRS     1
+#define HK_USER_SGPR 2
+#define HK_THREADS   64
 
-	f = filp_open("/dev/kfd", O_RDWR | O_CLOEXEC, 0);
-	if (IS_ERR(f)) {
-		pr_err("hk: /dev/kfd open failed: %ld\n", PTR_ERR(f));
-		return NULL;
-	}
-	proc = f->private_data;
-	for (int i = 0; i < proc->n_pdds; i++) {
-		if (proc->pdds[i] && proc->pdds[i]->dev &&
-		    proc->pdds[i]->dev->adev)
-			return proc->pdds[i]->dev->adev;
-	}
-	pr_err("hk: no PDD with adev found\n");
-	return NULL;
-}
-
-/* --------------------------------------------------------------------------
- * Mailbox layout (simplified for Phase 2 test):
- *
- *   offset 0:  magic    (0x21544148 = completion signal)
- *   offset 4:  state    (1 = syscall_pending)
- *   offset 8:  syscall  (syscall number)
- *   offset 12: arg0     (first argument)
- *   offset 16: arg1     (second argument)
- */
+/* Mailbox structure (shared between GPU and CPU) */
 struct hk_mailbox {
 	uint32_t magic;
 	uint32_t state;
@@ -130,97 +85,122 @@ struct hk_mailbox {
 	uint32_t arg1;
 };
 
-/* Compute register defaults for minimal single-wavefront dispatch */
-#define HK_VGPRS     0   /* (0+1)*4 = 4 VGPR */
-#define HK_SGPRS     1   /* (1+1)*8 = 16 SGPR */
-#define HK_USER_SGPR 2   /* s[0:1] = USER_DATA_0/1 */
-#define HK_THREADS   64  /* threads per workgroup */
-
-/* --------------------------------------------------------------------------
- * Interrupt-driven completion via dma_fence callback.
- *
- * Instead of polling dma_fence_wait_timeout(), we register a callback
- * that fires when the IB completes. Under the hood, amdgpu signals the
- * fence from the IH (Interrupt Handler) interrupt context — so this
- * callback proves the GPU→CPU interrupt path works.
- */
-struct hk_fence_cb {
-	struct dma_fence_cb base;
-	struct completion   done;
-	uint32_t           *mailbox;   /* CPU pointer to mailbox */
-	uint32_t            dwords;
-};
-
-static void hk_fence_callback(struct dma_fence *f, struct dma_fence_cb *cb)
+/* ==========================================================================
+ * Device discovery
+ * ========================================================================== */
+static struct amdgpu_device *hk_get_adev(void)
 {
-	struct hk_fence_cb *hcb = container_of(cb, struct hk_fence_cb, base);
+	struct kfd_process *proc;
+	struct file *f;
 
-	pr_info("hk: *** IH interrupt fired! callback in %s context ***\n",
-		in_task() ? "task" : in_irq() ? "irq" : in_softirq() ? "softirq" : "unknown");
-
-	for (u32 i = 0; i < hcb->dwords; i++)
-		pr_info("hk:   mailbox[%u] = 0x%08x\n", i, hcb->mailbox[i]);
-
-	dma_fence_put(f);
-	complete(&hcb->done);
+	f = filp_open("/dev/kfd", O_RDWR | O_CLOEXEC, 0);
+	if (IS_ERR(f)) {
+		pr_err("hk: /dev/kfd: %ld\n", PTR_ERR(f));
+		return NULL;
+	}
+	proc = f->private_data;
+	for (int i = 0; i < proc->n_pdds; i++)
+		if (proc->pdds[i] && proc->pdds[i]->dev &&
+		    proc->pdds[i]->dev->adev)
+			return proc->pdds[i]->dev->adev;
+	pr_err("hk: no PDD with adev\n");
+	return NULL;
 }
 
-/* --------------------------------------------------------------------------
- * Dispatch: run shader on kernel compute ring via IB.
+/* ==========================================================================
+ * GCN task context — one per spawned GCN task
  *
- * Uses dma_fence_add_callback for interrupt-driven completion.
- *
- * The mailbox buffer (result_dwords * 4 bytes) is allocated as a kernel BO
- * so it survives beyond IB lifetime. Its GPU address is passed to the shader
- * via COMPUTE_USER_DATA_0/1.
- */
-static int hk_dispatch(struct amdgpu_device *adev,
-		       const uint32_t *shader, uint32_t shader_dwords,
-		       uint32_t *result, uint32_t result_dwords)
+ *   task_comm = thread name  (kthread → GCN → CPU → ...)
+ *   mailbox  = GPU-accessible BO for GPU→CPU communication
+ *   fence_cb = dma_fence callback — fires from IH IRQ context, wakes task
+ * ========================================================================== */
+struct hk_gcn_ctx {
+	struct amdgpu_device *adev;
+
+	/* Persistent mailbox BO */
+	struct amdgpu_bo *mb_bo;
+	void             *mb_cpu;
+	u64               mb_gpu_addr;
+	u32               mb_dwords;
+
+	/* Owning task (NULL until spawned) */
+	struct task_struct *task;
+
+	/* Async completion: fence callback wakes the owning task */
+	struct dma_fence_cb fence_cb;
+	struct dma_fence   *fence;       /* held until callback fires */
+	int                 fence_ret;   /* result of add_callback */
+};
+
+static void hk_gcn_wakeup(struct dma_fence *f, struct dma_fence_cb *cb)
 {
+	struct hk_gcn_ctx *ctx = container_of(cb, struct hk_gcn_ctx, fence_cb);
+
+	pr_info("hk: *** IH → wake %s [%d] (IRQ context: %s) ***\n",
+		ctx->task->comm, task_pid_nr(ctx->task),
+		in_irq() ? "yes" : "no");
+
+	dma_fence_put(f);
+	ctx->fence = NULL;
+	wake_up_process(ctx->task);
+}
+
+/* Allocate mailbox BO for a GCN task context */
+static int hk_gcn_mailbox_alloc(struct hk_gcn_ctx *ctx, u32 dwords)
+{
+	int ret = amdgpu_bo_create_kernel(ctx->adev, dwords * 4, PAGE_SIZE,
+					  AMDGPU_GEM_DOMAIN_GTT,
+					  &ctx->mb_bo,
+					  &ctx->mb_gpu_addr,
+					  &ctx->mb_cpu);
+	if (ret)
+		return ret;
+	ctx->mb_dwords = dwords;
+	memset(ctx->mb_cpu, 0, dwords * 4);
+	return 0;
+}
+
+static void hk_gcn_mailbox_free(struct hk_gcn_ctx *ctx)
+{
+	if (ctx->mb_bo)
+		amdgpu_bo_free_kernel(&ctx->mb_bo,
+				      &ctx->mb_gpu_addr,
+				      &ctx->mb_cpu);
+	ctx->mb_bo = NULL;
+}
+
+/* ==========================================================================
+ * Dispatch: submit shader on kernel compute ring via IB.
+ *
+ * Uses the GCN context's pre-allocated mailbox BO (ctx->mb_gpu_addr →
+ * COMPUTE_USER_DATA_0/1).  The calling task MUST be in TASK_UNINTERRUPTIBLE
+ * state — this function calls schedule() after registering the fence
+ * callback, and returns only after the callback fires (IH → wake_up_process).
+ * ========================================================================== */
+static int hk_dispatch_ctx(struct hk_gcn_ctx *ctx,
+			   const uint32_t *shader, u32 shader_dwords)
+{
+	struct amdgpu_device *adev = ctx->adev;
 	struct amdgpu_ring *kring = &adev->gfx.compute_ring[0];
 	struct amdgpu_ib ib;
-	struct dma_fence *f = NULL;
-	struct amdgpu_bo *mb_bo = NULL;
-	void *mb_cpu = NULL;
-	u64 mb_gpu_addr;
-	u32 total_size, shader_offset;
+	u32 shader_off = 256, total_size = shader_off + 256;
 	u64 pgm_addr;
-	struct hk_fence_cb hcb;
 	int ret;
 
-	if (!kring->sched.ready) {
-		pr_err("hk: compute ring not ready\n");
+	if (!kring->sched.ready)
 		return -ENODEV;
-	}
-
-	/* Allocate persistent mailbox BO (survives IB free) */
-	ret = amdgpu_bo_create_kernel(adev, result_dwords * 4, PAGE_SIZE,
-				      AMDGPU_GEM_DOMAIN_GTT,
-				      &mb_bo, &mb_gpu_addr, &mb_cpu);
-	if (ret) {
-		pr_err("hk: bo_create_kernel: %d\n", ret);
-		return ret;
-	}
-	memset(mb_cpu, 0, result_dwords * 4);
-
-	/* Lay out IB: commands (256B) + shader (256B) */
-	shader_offset = 256;
-	total_size    = shader_offset + 256;
 
 	memset(&ib, 0, sizeof(ib));
 	ret = amdgpu_ib_get(adev, NULL, total_size,
 			    AMDGPU_IB_POOL_DIRECT, &ib);
-	if (ret) {
-		pr_err("hk: ib_get: %d\n", ret);
-		goto out_free_bo;
-	}
+	if (ret)
+		return ret;
 
 	memset(ib.ptr, 0, total_size / 4);
 	for (u32 i = 0; i < shader_dwords; i++)
-		ib.ptr[i + (shader_offset / 4)] = shader[i];
+		ib.ptr[i + (shader_off / 4)] = shader[i];
 
-	/* --- Build PM4 command stream --- */
+	/* --- PM4 command stream --- */
 	ib.length_dw = 0;
 
 	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 1);
@@ -239,8 +219,7 @@ static int hk_dispatch(struct amdgpu_device *adev,
 		u32 rsrc1 = REG_SET_FIELD(0, COMPUTE_PGM_RSRC1, VGPRS, HK_VGPRS);
 		rsrc1 = REG_SET_FIELD(rsrc1, COMPUTE_PGM_RSRC1, SGPRS, HK_SGPRS);
 		rsrc1 = REG_SET_FIELD(rsrc1, COMPUTE_PGM_RSRC1, DX10_CLAMP, 1);
-		u32 rsrc2 = REG_SET_FIELD(0, COMPUTE_PGM_RSRC2, USER_SGPR,
-					  HK_USER_SGPR);
+		u32 rsrc2 = REG_SET_FIELD(0, COMPUTE_PGM_RSRC2, USER_SGPR, HK_USER_SGPR);
 		ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
 		ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_PGM_RSRC1)
 					- PACKET3_SET_SH_REG_START;
@@ -254,7 +233,7 @@ static int hk_dispatch(struct amdgpu_device *adev,
 	ib.ptr[ib.length_dw++] = 0xffffffff;
 	ib.ptr[ib.length_dw++] = 0xffffffff;
 
-	pgm_addr = (ib.gpu_addr + (u64)shader_offset) >> 8;
+	pgm_addr = (ib.gpu_addr + shader_off) >> 8;
 	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
 	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_PGM_LO)
 				- PACKET3_SET_SH_REG_START;
@@ -264,8 +243,8 @@ static int hk_dispatch(struct amdgpu_device *adev,
 	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
 	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_USER_DATA_0)
 				- PACKET3_SET_SH_REG_START;
-	ib.ptr[ib.length_dw++] = lower_32_bits(mb_gpu_addr);
-	ib.ptr[ib.length_dw++] = upper_32_bits(mb_gpu_addr);
+	ib.ptr[ib.length_dw++] = lower_32_bits(ctx->mb_gpu_addr);
+	ib.ptr[ib.length_dw++] = upper_32_bits(ctx->mb_gpu_addr);
 
 	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_DISPATCH_DIRECT, 3);
 	ib.ptr[ib.length_dw++] = 1;
@@ -277,96 +256,255 @@ static int hk_dispatch(struct amdgpu_device *adev,
 	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_EVENT_WRITE, 0);
 	ib.ptr[ib.length_dw++] = EVENT_TYPE(7) | EVENT_INDEX(4);
 
-	pr_info("hk: IB %u dwords  gpu=0x%llx  shader=0x%llx  mailbox=0x%llx\n",
-		ib.length_dw, ib.gpu_addr,
-		ib.gpu_addr + shader_offset, mb_gpu_addr);
+	pr_info("hk: IB %u dwords  gpu=0x%llx  mailbox=0x%llx\n",
+		ib.length_dw, ib.gpu_addr, ctx->mb_gpu_addr);
 
-	/* Submit IB */
-	ret = amdgpu_ib_schedule(kring, 1, &ib, NULL, &f);
+	/* Submit IB, free it immediately (mailbox outlives it) */
+	ret = amdgpu_ib_schedule(kring, 1, &ib, NULL, &ctx->fence);
 	amdgpu_ib_free(adev, &ib, NULL);
 	if (ret) {
-		pr_err("hk: ib_schedule: %d\n", ret);
-		goto out_free_bo;
+		ctx->fence = NULL;
+		return ret;
 	}
 
-	/* Register interrupt-driven callback */
-	init_completion(&hcb.done);
-	hcb.mailbox = mb_cpu;
-	hcb.dwords  = result_dwords;
-
-	ret = dma_fence_add_callback(f, &hcb.base, hk_fence_callback);
-	if (ret == -ENOENT) {
-		/* Fence already signaled — read immediately */
-		pr_info("hk: fence already signaled, reading directly\n");
-		hk_fence_callback(f, &hcb.base);
-	} else if (ret) {
-		pr_err("hk: fence_add_callback: %d\n", ret);
-		dma_fence_put(f);
-		goto out_free_bo;
+	/* Register fence callback: IH fires → hk_gcn_wakeup → wake_up_process(this) */
+	ctx->fence_ret = dma_fence_add_callback(ctx->fence, &ctx->fence_cb,
+						hk_gcn_wakeup);
+	if (ctx->fence_ret == -ENOENT) {
+		/* Already signaled — wake ourselves immediately */
+		hk_gcn_wakeup(ctx->fence, &ctx->fence_cb);
+	} else if (ctx->fence_ret) {
+		pr_err("hk: fence_add_callback: %d\n", ctx->fence_ret);
+		dma_fence_put(ctx->fence);
+		ctx->fence = NULL;
+		return ctx->fence_ret;
 	} else {
-		/* Wait for the IH interrupt to fire the callback */
-		pr_info("hk: waiting for IH interrupt...\n");
-		wait_for_completion(&hcb.done);
+		/* Sleep until IH interrupt wakes us via hk_gcn_wakeup */
+		pr_info("hk: %s [%d] → GPU (sleep)\n",
+			current->comm, task_pid_nr(current));
+		schedule();
+		pr_info("hk: %s [%d] ← GPU (wake)\n",
+			current->comm, task_pid_nr(current));
 	}
 
-	/* Copy mailbox to caller's result buffer */
-	memcpy(result, mb_cpu, result_dwords * sizeof(uint32_t));
+	return 0;
+}
 
-	ret = 0;
+/* ==========================================================================
+ * GCN kthread — the "user-mode" GCN task lifecycle
+ *
+ *   while (alive):
+ *     1. Write desired operation to mailbox (or let shader write it)
+ *     2. Submit GCN dispatch → sleep (TASK_UNINTERRUPTIBLE)
+ *     3. IH interrupt → fence callback → wake_up_process(this)
+ *     4. Read mailbox on CPU, "execute" the requested syscall
+ *     5. Loop or exit
+ *
+ * This is the precursor to clone3(CLONE_GCN) — the only difference is
+ * how the task is created (kthread vs clone3). The lifecycle pattern
+ * (sleep → GPU → IH → wake → mailbox → repeat) is the same.
+ * ========================================================================== */
+static int hk_gcn_thread(void *data)
+{
+	struct hk_gcn_ctx *ctx = data;
+
+	ctx->task = current;  /* required for hk_gcn_wakeup → wake_up_process */
+
+	pr_info("hk: GCN task %s [%d] born\n", current->comm, task_pid_nr(current));
+
+	while (!kthread_should_stop()) {
+		/* --- Step 1: prepare mailbox (GPU will write into it) --- */
+		memset(ctx->mb_cpu, 0, ctx->mb_dwords * 4);
+
+		/* --- Step 2: dispatch → sleep → IH wakes us --- */
+		set_current_state(TASK_UNINTERRUPTIBLE);
+		if (hk_dispatch_ctx(ctx, mailbox_shader,
+				    ARRAY_SIZE(mailbox_shader))) {
+			__set_current_state(TASK_RUNNING);
+			break;
+		}
+		__set_current_state(TASK_RUNNING);
+
+		/* --- Step 3: IH woke us! Read the mailbox --- */
+		{
+			uint32_t *mb = ctx->mb_cpu;
+			pr_info("hk: GCN task mailbox: magic=0x%x state=%u syscall=%u args=[0x%x,0x%x]\n",
+				mb[0], mb[1], mb[2], mb[3], mb[4]);
+
+			/* --- Step 4: "execute" the requested operation --- */
+			if (mb[1] == 1) /* state == syscall_pending */
+				pr_info("hk: GCN task would execute syscall %u\n", mb[2]);
+		}
+
+		/* --- Step 5: done with one GPU→CPU cycle --- */
+	}
+
+	pr_info("hk: GCN task %s [%d] exiting\n", current->comm, task_pid_nr(current));
+	return 0;
+}
+
+/* ==========================================================================
+ * sysfs interface
+ * ========================================================================== */
+
+/* /sys/kernel/heteroken/run — single-shot sync dispatch (P1/P2 compat) */
+static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
+			 const char *buf, size_t count)
+{
+	struct amdgpu_device *adev = hk_get_adev();
+	struct amdgpu_ring *kring;
+	struct amdgpu_ib ib;
+	struct dma_fence *f = NULL;
+	struct amdgpu_bo *mb_bo = NULL;
+	void *mb_cpu = NULL;
+	u64 mb_gpu_addr, pgm_addr;
+	u32 shader_off = 256, total_size = shader_off + 256;
+	int ret;
+
+	if (!adev) return -ENODEV;
+	kring = &adev->gfx.compute_ring[0];
+	if (!kring->sched.ready) return -ENODEV;
+
+	/* Mailbox BO */
+	ret = amdgpu_bo_create_kernel(adev, 20, PAGE_SIZE,
+				      AMDGPU_GEM_DOMAIN_GTT,
+				      &mb_bo, &mb_gpu_addr, &mb_cpu);
+	if (ret) return ret;
+	memset(mb_cpu, 0, 20);
+
+	/* IB */
+	memset(&ib, 0, sizeof(ib));
+	ret = amdgpu_ib_get(adev, NULL, total_size,
+			    AMDGPU_IB_POOL_DIRECT, &ib);
+	if (ret) goto out_free_bo;
+	memset(ib.ptr, 0, total_size / 4);
+	memcpy(ib.ptr + shader_off/4, mailbox_shader, sizeof(mailbox_shader));
+
+	/* PM4 commands (same pattern as hk_dispatch_ctx) */
+	ib.length_dw = 0;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 1);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_RESOURCE_LIMITS) - PACKET3_SET_SH_REG_START; ib.ptr[ib.length_dw++] = 0;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 3);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_NUM_THREAD_X) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = HK_THREADS; ib.ptr[ib.length_dw++] = 1; ib.ptr[ib.length_dw++] = 1;
+	{ u32 r1 = REG_SET_FIELD(REG_SET_FIELD(REG_SET_FIELD(0, COMPUTE_PGM_RSRC1, VGPRS, HK_VGPRS), COMPUTE_PGM_RSRC1, SGPRS, HK_SGPRS), COMPUTE_PGM_RSRC1, DX10_CLAMP, 1);
+	u32 r2 = REG_SET_FIELD(0, COMPUTE_PGM_RSRC2, USER_SGPR, HK_USER_SGPR);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_PGM_RSRC1) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = r1; ib.ptr[ib.length_dw++] = r2; }
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_STATIC_THREAD_MGMT_SE0) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = 0xffffffff; ib.ptr[ib.length_dw++] = 0xffffffff;
+	pgm_addr = (ib.gpu_addr + shader_off) >> 8;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_PGM_LO) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = lower_32_bits(pgm_addr); ib.ptr[ib.length_dw++] = upper_32_bits(pgm_addr);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_USER_DATA_0) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = lower_32_bits(mb_gpu_addr); ib.ptr[ib.length_dw++] = upper_32_bits(mb_gpu_addr);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_DISPATCH_DIRECT, 3);
+	ib.ptr[ib.length_dw++] = 1; ib.ptr[ib.length_dw++] = 1; ib.ptr[ib.length_dw++] = 1;
+	ib.ptr[ib.length_dw++] = REG_SET_FIELD(0, COMPUTE_DISPATCH_INITIATOR, COMPUTE_SHADER_EN, 1);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_EVENT_WRITE, 0);
+	ib.ptr[ib.length_dw++] = EVENT_TYPE(7) | EVENT_INDEX(4);
+
+	ret = amdgpu_ib_schedule(kring, 1, &ib, NULL, &f);
+	amdgpu_ib_free(adev, &ib, NULL);
+	if (ret) goto out_free_bo;
+
+	ret = dma_fence_wait_timeout(f, false, msecs_to_jiffies(10000));
+	dma_fence_put(f);
+	if (ret <= 0) { ret = -ETIMEDOUT; goto out_free_bo; }
+
+	{ uint32_t *mb = mb_cpu;
+	pr_info("hk: run: magic=0x%x state=%u syscall=%u arg0=0x%x arg1=0x%x\n",
+		mb[0], mb[1], mb[2], mb[3], mb[4]); }
+	ret = count;
 
 out_free_bo:
 	amdgpu_bo_free_kernel(&mb_bo, &mb_gpu_addr, &mb_cpu);
 	return ret;
 }
+static struct kobj_attribute run_attr = __ATTR_WO(run);
 
-/* ==========================================================================
- * sysfs trigger: /sys/kernel/heteroken/run
- */
-static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
-			 const char *buf, size_t count)
+/* /sys/kernel/heteroken/spawn — create a persistent GCN kthread */
+static struct task_struct *hk_spawned_task;
+static struct hk_gcn_ctx    hk_spawn_ctx;
+
+static ssize_t spawn_store(struct kobject *kobj, struct kobj_attribute *attr,
+			   const char *buf, size_t count)
 {
-	struct amdgpu_device *adev;
-	uint32_t result;
-	int ret;
-
-	adev = hk_get_adev();
-	if (!adev)
-		return -ENODEV;
-
-	pr_info("hk: dispatching mailbox shader (%u dwords)\n",
-		MAILBOX_SHADER_DW);
-	{
-		uint32_t mb[5];
-		int ret = hk_dispatch(adev, hello_mailbox, MAILBOX_SHADER_DW, mb, 5);
-		if (ret) {
-			pr_err("hk: dispatch failed: %d\n", ret);
-			return count;
-		}
-		pr_info("hk: mailbox: magic=0x%08x state=%u syscall=%u arg0=0x%x arg1=0x%x\n",
-			mb[0], mb[1], mb[2], mb[3], mb[4]);
+	if (hk_spawned_task) {
+		pr_info("hk: GCN task already running, stop it first\n");
+		return -EBUSY;
 	}
 
+	memset(&hk_spawn_ctx, 0, sizeof(hk_spawn_ctx));
+	hk_spawn_ctx.adev = hk_get_adev();
+	if (!hk_spawn_ctx.adev) return -ENODEV;
+
+	if (hk_gcn_mailbox_alloc(&hk_spawn_ctx, 5))
+		return -ENOMEM;
+
+	hk_spawned_task = kthread_run(hk_gcn_thread, &hk_spawn_ctx,
+				      "hk-gcn-0");
+	if (IS_ERR(hk_spawned_task)) {
+		pr_err("hk: kthread_run failed\n");
+		hk_gcn_mailbox_free(&hk_spawn_ctx);
+		return PTR_ERR(hk_spawned_task);
+	}
+
+	pr_info("hk: GCN task spawned: %s [%d]\n",
+		hk_spawned_task->comm, task_pid_nr(hk_spawned_task));
 	return count;
 }
+static struct kobj_attribute spawn_attr = __ATTR_WO(spawn);
 
-static struct kobj_attribute run_attr = __ATTR_WO(run);
+/* /sys/kernel/heteroken/stop — stop the GCN kthread */
+static ssize_t stop_store(struct kobject *kobj, struct kobj_attribute *attr,
+			  const char *buf, size_t count)
+{
+	if (!hk_spawned_task)
+		return -ENOENT;
+
+	pr_info("hk: stopping GCN task %s [%d]\n",
+		hk_spawned_task->comm, task_pid_nr(hk_spawned_task));
+
+	/* Wake the task if it's sleeping in schedule() */
+	wake_up_process(hk_spawned_task);
+	kthread_stop(hk_spawned_task);
+	hk_spawned_task = NULL;
+	hk_gcn_mailbox_free(&hk_spawn_ctx);
+
+	pr_info("hk: GCN task stopped\n");
+	return count;
+}
+static struct kobj_attribute stop_attr = __ATTR_WO(stop);
+
+/* ==========================================================================
+ * Module init/exit
+ * ========================================================================== */
 static struct kobject *hk_kobj;
 
 static int __init hk_init(void)
 {
-	pr_info("hk: HeteroKern GCN compute dispatch ready (gfx902)\n");
+	pr_info("hk: HeteroKern ready (gfx902, phases 1-3)\n");
 	hk_kobj = kobject_create_and_add("heteroken", kernel_kobj);
-	if (!hk_kobj)
-		return -ENOMEM;
-	if (sysfs_create_file(hk_kobj, &run_attr.attr))
-		pr_warn("hk: sysfs create failed\n");
+	if (!hk_kobj) return -ENOMEM;
+	if (sysfs_create_file(hk_kobj, &run_attr.attr))  pr_warn("hk: run failed\n");
+	if (sysfs_create_file(hk_kobj, &spawn_attr.attr)) pr_warn("hk: spawn failed\n");
+	if (sysfs_create_file(hk_kobj, &stop_attr.attr))  pr_warn("hk: stop failed\n");
 	return 0;
 }
 
 static void __exit hk_exit(void)
 {
-	if (hk_kobj)
-		kobject_put(hk_kobj);
+	if (hk_spawned_task) {
+		wake_up_process(hk_spawned_task);
+		kthread_stop(hk_spawned_task);
+		hk_gcn_mailbox_free(&hk_spawn_ctx);
+	}
+	if (hk_kobj) kobject_put(hk_kobj);
 	pr_info("hk: unloaded\n");
 }
 

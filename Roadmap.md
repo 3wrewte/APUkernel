@@ -281,16 +281,24 @@ read back by CPU via kernel compute ring + IB dispatch.
 | 2.5 | GCN task on CPU: read mailbox → call `do_syscall_64()` → write result → re-dispatch AQL → sleep | Syscall executed as the GCN task |
 | 2.6 | Test: GCN wavefront issues `write(1, "hello from CU\n", 14)` via mailbox → output appears on stdout | End-to-end syscall works |
 
-### Phase 3: Clone Hook + GCN Task Birth [ONLINE + OFFLINE — 4-6 days]
+### Phase 3: Clone Hook + GCN Task Birth [IN PROGRESS — 4-6 days]
+
+**P3 core lifecycle verified (2026-06-16)** via kthread: `sleep → GPU → IH → wake → CPU → repeat`.
+The only difference from final clone3 design is task_struct origin (kthread vs clone3).
+
+**Architecture**: The dispatch layer is swappable — `hk_dispatch_ctx()` encapsulates
+kernel compute ring + IB. When KFD queue path works, only this function changes.
 
 | # | Task | Verification |
 |---|------|-------------|
-| 3.1 | Define `CLONE_GCN` flag value (`0x100000000` — bit 32 of clone3 flags) | Header file updated |
-| 3.2 | `struct hk_gcn_entry` — code_fd, kernel name, arg pointer, flags | Header + userspace API |
-| 3.3 | Hook `copy_process()`: detect `CLONE_GCN` → allocate mailbox, HSA signal, shadow context slot | Child task has GPU context |
-| 3.4 | Post-clone: construct AQL packet from `hk_gcn_entry`, submit to HSA queue, set task UNINTERRUPTIBLE | Task sleeping, wave running |
-| 3.5 | `libheteroken` userspace wrapper: `hk_spawn(entry, clone_flags)` → `clone3()` | Test program compiles |
-| 3.6 | Test: `hk_spawn()` creates GCN task, it runs, writes result, exits | Test 0 + Test 1 from tests.txt |
+| 3.1 | `struct hk_gcn_ctx` — mailbox BO, fence_cb, owning task pointer | Compiles + boots ✅ |
+| 3.2 | `hk_dispatch_ctx()` — refactored dispatch with pre-allocated mailbox, fence callback → `wake_up_process()` | IH wakes task ✅ |
+| 3.3 | `hk_gcn_thread()` — kthread lifecycle: submit → sleep → wake → loop → stop | 50+ iterations ✅ |
+| 3.4 | sysfs `spawn` / `stop` nodes — create and destroy GCN kthreads | Clean start/stop ✅ |
+| 3.5 | Define `CLONE_GCN` flag + clone3 hook in `kernel/fork.c` | Pending |
+| 3.6 | Hook `copy_process()`: detect `CLONE_GCN` → call `hk_clone_gcn_callback` | Pending |
+| 3.7 | Post-clone: allocate mailbox, submit dispatch via `hk_dispatch_ctx()`, task → UNINTERRUPTIBLE | Pending |
+| 3.8 | Test: real user-space task created via clone3, runs on GPU, exits | Pending |
 
 ### Phase 4: CoW Semantics + Address Space [ONLINE — 3-5 days]
 
@@ -559,3 +567,8 @@ APUkernel/
 | 2026-06-15 | 2 | Mailbox shader: 26-dword gfx902 code, writes 5 structured fields to mailbox BO | ✅ |
 | 2026-06-15 | 2 | `amdgpu_bo_create_kernel()`: persistent mailbox BO survives IB lifetime | ✅ |
 | 2026-06-15 | 2 | `dma_fence_add_callback()`: IH interrupt fires callback in IRQ context, reads mailbox | ✅ |
+| 2026-06-16 | 2 | `hk_dispatch_ctx()`: refactored dispatch with pre-allocated mailbox BO + task wakeup via `schedule()` + `wake_up_process()` | ✅ |
+| 2026-06-16 | 3 | **Phase 3 GCN task lifecycle complete!** kthread → GPU (sleep) → IH IRQ → wake → CPU → loop → stop | ✅ |
+| 2026-06-16 | 3 | `struct hk_gcn_ctx`: per-task GPU context (mailbox BO, fence_cb, owning task) | ✅ |
+| 2026-06-16 | 3 | sysfs `spawn` / `stop`: create/kill GCN kthread, each iteration 12ms (IB→IH→wake) | ✅ |
+| 2026-06-16 | 3 | **Verified**: 50+ GPU→CPU cycles without failure, mailbox data correct, clean exit | ✅ |
