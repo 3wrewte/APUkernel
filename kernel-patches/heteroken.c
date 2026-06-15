@@ -6,6 +6,7 @@
  *   P1 — GPU wavefront executes + magic value
  *   P2 — Mailbox protocol + IH interrupt → CPU wakeup
  *   P3 — GCN task lifecycle (kthread → GPU → IH wake → CPU → repeat)
+ *  +hello  — "hello from CU\n" shader + result_show sysfs node
  *
  * ==========================================================================
  * DISPATCH LAYER
@@ -22,6 +23,7 @@
 #include <linux/completion.h>
 #include <linux/dma-fence.h>
 #include <linux/kthread.h>
+#include <linux/mutex.h>
 
 #include "kfd_priv.h"
 #include "../amdgpu/amdgpu_amdkfd.h"
@@ -47,7 +49,24 @@ static const uint32_t hello_shader[] = {
 	0xBF810000,
 };
 
-/* 26-dword "mailbox": writes 5 struct fields to s[0:1] */
+/* 23-dword "hello_string": writes "hello from CU\n" to s[0:1] */
+static const uint32_t hello_string[] = {
+	0xBF8CC07F,                /* s_waitcnt lgkmcnt(0) */
+	0x7E000200,                /* v_mov_b32_e32 v0, s0 */
+	0x7E020201,                /* v_mov_b32_e32 v1, s1 */
+	0x7E0402FF, 0x6C6C6568,   /* v2="hell" → store */
+	0xDC700000, 0x00000200,
+	0x68000084,                /* v_add_u32_e32 v0,4,v0 */
+	0x7E0402FF, 0x7266206F,   /* v2="o fr" → store */
+	0xDC700000, 0x00000200,
+	0x68000084,
+	0x7E0402FF, 0x43206D6F,   /* v2="om C" → store */
+	0xDC700000, 0x00000200,
+	0x68000084,
+	0x7E0402FF, 0x00000A55,   /* v2="U\n\0" → store */
+	0xDC700000, 0x00000200,
+	0xBF810000,                /* s_endpgm */
+};
 static const uint32_t mailbox_shader[] = {
 	0xBF8CC07F,                /* s_waitcnt lgkmcnt(0) */
 	0x7E000200,                /* v_mov_b32_e32 v0, s0 */
@@ -347,6 +366,10 @@ static int hk_gcn_thread(void *data)
  * sysfs interface
  * ========================================================================== */
 
+/* Forward — defined below after mailbox alloc functions */
+static char hk_last_result[256];
+static DEFINE_MUTEX(hk_result_lock);
+
 /* /sys/kernel/heteroken/run — single-shot sync dispatch (P1/P2 compat) */
 static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
 			 const char *buf, size_t count)
@@ -418,7 +441,12 @@ static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
 
 	{ uint32_t *mb = mb_cpu;
 	pr_info("hk: run: magic=0x%x state=%u syscall=%u arg0=0x%x arg1=0x%x\n",
-		mb[0], mb[1], mb[2], mb[3], mb[4]); }
+		mb[0], mb[1], mb[2], mb[3], mb[4]);
+	mutex_lock(&hk_result_lock);
+	scnprintf(hk_last_result, sizeof(hk_last_result),
+		  "magic=0x%x state=%u syscall=%u arg0=0x%x arg1=0x%x",
+		  mb[0], mb[1], mb[2], mb[3], mb[4]);
+	mutex_unlock(&hk_result_lock); }
 	ret = count;
 
 out_free_bo:
@@ -481,6 +509,97 @@ static ssize_t stop_store(struct kobject *kobj, struct kobj_attribute *attr,
 }
 static struct kobj_attribute stop_attr = __ATTR_WO(stop);
 
+/* /sys/kernel/heteroken/result — read last dispatch output as string */
+static ssize_t result_show(struct kobject *kobj, struct kobj_attribute *attr,
+			   char *buf)
+{
+	ssize_t len;
+	mutex_lock(&hk_result_lock);
+	len = scnprintf(buf, PAGE_SIZE, "%s\n", hk_last_result);
+	mutex_unlock(&hk_result_lock);
+	return len;
+}
+static struct kobj_attribute result_attr = __ATTR_RO(result);
+
+/* /sys/kernel/heteroken/hello — run hello_string shader, store output */
+static ssize_t hello_store(struct kobject *kobj, struct kobj_attribute *attr,
+			   const char *buf, size_t count)
+{
+	struct amdgpu_device *adev = hk_get_adev();
+	struct amdgpu_ring *kring;
+	struct amdgpu_ib ib;
+	struct dma_fence *f = NULL;
+	struct amdgpu_bo *mb_bo = NULL;
+	void *mb_cpu = NULL;
+	u64 mb_gpu_addr, pgm_addr;
+	u32 shader_off = 256, total_size = shader_off + 256;
+	int ret;
+
+	if (!adev) return -ENODEV;
+	kring = &adev->gfx.compute_ring[0];
+	if (!kring->sched.ready) return -ENODEV;
+
+	ret = amdgpu_bo_create_kernel(adev, 64, PAGE_SIZE,
+				      AMDGPU_GEM_DOMAIN_GTT,
+				      &mb_bo, &mb_gpu_addr, &mb_cpu);
+	if (ret) return ret;
+	memset(mb_cpu, 0, 64);
+
+	memset(&ib, 0, sizeof(ib));
+	ret = amdgpu_ib_get(adev, NULL, total_size,
+			    AMDGPU_IB_POOL_DIRECT, &ib);
+	if (ret) goto out_free_bo;
+	memset(ib.ptr, 0, total_size / 4);
+	memcpy(ib.ptr + shader_off/4, hello_string, sizeof(hello_string));
+
+	ib.length_dw = 0;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 1);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_RESOURCE_LIMITS) - PACKET3_SET_SH_REG_START; ib.ptr[ib.length_dw++] = 0;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 3);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_NUM_THREAD_X) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = HK_THREADS; ib.ptr[ib.length_dw++] = 1; ib.ptr[ib.length_dw++] = 1;
+	{ u32 r1 = REG_SET_FIELD(REG_SET_FIELD(REG_SET_FIELD(0, COMPUTE_PGM_RSRC1, VGPRS, HK_VGPRS), COMPUTE_PGM_RSRC1, SGPRS, HK_SGPRS), COMPUTE_PGM_RSRC1, DX10_CLAMP, 1);
+	u32 r2 = REG_SET_FIELD(0, COMPUTE_PGM_RSRC2, USER_SGPR, HK_USER_SGPR);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_PGM_RSRC1) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = r1; ib.ptr[ib.length_dw++] = r2; }
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_STATIC_THREAD_MGMT_SE0) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = 0xffffffff; ib.ptr[ib.length_dw++] = 0xffffffff;
+	pgm_addr = (ib.gpu_addr + shader_off) >> 8;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_PGM_LO) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = lower_32_bits(pgm_addr); ib.ptr[ib.length_dw++] = upper_32_bits(pgm_addr);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_USER_DATA_0) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = lower_32_bits(mb_gpu_addr); ib.ptr[ib.length_dw++] = upper_32_bits(mb_gpu_addr);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_DISPATCH_DIRECT, 3);
+	ib.ptr[ib.length_dw++] = 1; ib.ptr[ib.length_dw++] = 1; ib.ptr[ib.length_dw++] = 1;
+	ib.ptr[ib.length_dw++] = REG_SET_FIELD(0, COMPUTE_DISPATCH_INITIATOR, COMPUTE_SHADER_EN, 1);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_EVENT_WRITE, 0);
+	ib.ptr[ib.length_dw++] = EVENT_TYPE(7) | EVENT_INDEX(4);
+
+	ret = amdgpu_ib_schedule(kring, 1, &ib, NULL, &f);
+	amdgpu_ib_free(adev, &ib, NULL);
+	if (ret) goto out_free_bo;
+
+	ret = dma_fence_wait_timeout(f, false, msecs_to_jiffies(10000));
+	dma_fence_put(f);
+	if (ret <= 0) { ret = -ETIMEDOUT; goto out_free_bo; }
+
+	mutex_lock(&hk_result_lock);
+	memcpy(hk_last_result, mb_cpu, 64);
+	hk_last_result[63] = '\0';
+	mutex_unlock(&hk_result_lock);
+	pr_info("hk: hello: '%s'\n", hk_last_result);
+	ret = count;
+
+out_free_bo:
+	amdgpu_bo_free_kernel(&mb_bo, &mb_gpu_addr, &mb_cpu);
+	return ret;
+}
+static struct kobj_attribute hello_attr = __ATTR_WO(hello);
+
 /* ==========================================================================
  * Module init/exit
  * ========================================================================== */
@@ -491,9 +610,11 @@ static int __init hk_init(void)
 	pr_info("hk: HeteroKern ready (gfx902, phases 1-3)\n");
 	hk_kobj = kobject_create_and_add("heteroken", kernel_kobj);
 	if (!hk_kobj) return -ENOMEM;
-	if (sysfs_create_file(hk_kobj, &run_attr.attr))  pr_warn("hk: run failed\n");
-	if (sysfs_create_file(hk_kobj, &spawn_attr.attr)) pr_warn("hk: spawn failed\n");
-	if (sysfs_create_file(hk_kobj, &stop_attr.attr))  pr_warn("hk: stop failed\n");
+	if (sysfs_create_file(hk_kobj, &run_attr.attr))    pr_warn("hk: run failed\n");
+	if (sysfs_create_file(hk_kobj, &spawn_attr.attr))  pr_warn("hk: spawn failed\n");
+	if (sysfs_create_file(hk_kobj, &stop_attr.attr))   pr_warn("hk: stop failed\n");
+	if (sysfs_create_file(hk_kobj, &hello_attr.attr))  pr_warn("hk: hello failed\n");
+	if (sysfs_create_file(hk_kobj, &result_attr.attr)) pr_warn("hk: result failed\n");
 	return 0;
 }
 

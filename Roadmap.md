@@ -572,3 +572,5 @@ APUkernel/
 | 2026-06-16 | 3 | `struct hk_gcn_ctx`: per-task GPU context (mailbox BO, fence_cb, owning task) | ✅ |
 | 2026-06-16 | 3 | sysfs `spawn` / `stop`: create/kill GCN kthread, each iteration 12ms (IB→IH→wake) | ✅ |
 | 2026-06-16 | 3 | **Verified**: 50+ GPU→CPU cycles without failure, mailbox data correct, clean exit | ✅ |
+| 2026-06-16 | 3 | **hello_string shader**: GCN writes "hello from CU\n" to GPU memory, CPU reads via sysfs `/result` | ✅ |
+| 2026-06-16 | 3 | `host_runner.sh` + `hello`/`result` sysfs nodes: GPU hello world end-to-end | ✅ |
