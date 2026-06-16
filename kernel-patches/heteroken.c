@@ -24,6 +24,9 @@
 #include <linux/dma-fence.h>
 #include <linux/kthread.h>
 #include <linux/mutex.h>
+#include <linux/miscdevice.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
 
 #include "kfd_priv.h"
 #include "../amdgpu/amdgpu_amdkfd.h"
@@ -601,12 +604,154 @@ out_free_bo:
 static struct kobj_attribute hello_attr = __ATTR_WO(hello);
 
 /* ==========================================================================
+ * Character device: /dev/heteroken
+ *
+ * ioctl interface for userspace host_runner:
+ *   HK_IOCTL_RUN: copy shader from user, dispatch on GPU, return result
+ *
+ * This is the userspace API. The host_runner:
+ *   1. fork() → child has dup'd mm (real task_struct, CoW)
+ *   2. child: open("/dev/heteroken"), ioctl(HK_IOCTL_RUN, shader)
+ *   3. kernel: dispatch shader on GPU, fence wait, copy result back
+ *   4. child returns with result, parent waitpid()
+ * ========================================================================== */
+#define HK_IOCTL_RUN _IOWR('H', 1, struct hk_run_req)
+
+struct hk_run_req {
+	__u64 shader_ptr;    /* user pointer to raw shader dwords */
+	__u32 shader_size;   /* bytes */
+	__u32 _pad;
+	__u64 result_ptr;    /* user pointer for result output */
+	__u32 result_size;   /* bytes available */
+};
+
+static long hk_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+	struct amdgpu_device *adev = hk_get_adev();
+	struct amdgpu_ring *kring;
+	struct hk_run_req req;
+	struct amdgpu_ib ib;
+	struct dma_fence *_fence = NULL;
+	struct amdgpu_bo *mb_bo = NULL;
+	void *mb_cpu = NULL;
+	u64 mb_gpu_addr, pgm_addr;
+	u32 shader_off = 256, total_size;
+	uint32_t *shader_copy = NULL;
+	int ret;
+
+	if (!adev) return -ENODEV;
+	kring = &adev->gfx.compute_ring[0];
+	if (!kring->sched.ready) return -ENODEV;
+
+	if (cmd != HK_IOCTL_RUN) return -EINVAL;
+
+	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+		return -EFAULT;
+	if (req.shader_size == 0 || req.shader_size > 4096)
+		return -EINVAL;
+	if (req.result_size == 0 || req.result_size > 4096)
+		return -EINVAL;
+
+	/* Copy shader binary from userspace */
+	shader_copy = kmalloc(req.shader_size, GFP_KERNEL);
+	if (!shader_copy) return -ENOMEM;
+	if (copy_from_user(shader_copy, (void __user *)req.shader_ptr,
+			   req.shader_size)) {
+		ret = -EFAULT;
+		goto out_free_shader;
+	}
+	pr_info("hk: ioctl: %u-byte shader from pid %d\n",
+		req.shader_size, current->pid);
+
+	/* Allocate mailbox BO for result */
+	ret = amdgpu_bo_create_kernel(adev, req.result_size, PAGE_SIZE,
+				      AMDGPU_GEM_DOMAIN_GTT,
+				      &mb_bo, &mb_gpu_addr, &mb_cpu);
+	if (ret) goto out_free_shader;
+	memset(mb_cpu, 0, req.result_size);
+
+	/* Allocate IB: commands (256B) + shader (aligned) */
+	total_size = shader_off + ALIGN(req.shader_size, 256);
+	memset(&ib, 0, sizeof(ib));
+	ret = amdgpu_ib_get(adev, NULL, total_size,
+			    AMDGPU_IB_POOL_DIRECT, &ib);
+	if (ret) goto out_free_bo;
+	memset(ib.ptr, 0, total_size / 4);
+	memcpy(ib.ptr + shader_off / 4, shader_copy, req.shader_size);
+
+	/* Build PM4 command stream */
+	ib.length_dw = 0;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 1);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_RESOURCE_LIMITS) - PACKET3_SET_SH_REG_START; ib.ptr[ib.length_dw++] = 0;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 3);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_NUM_THREAD_X) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = HK_THREADS; ib.ptr[ib.length_dw++] = 1; ib.ptr[ib.length_dw++] = 1;
+	{ u32 r1 = REG_SET_FIELD(REG_SET_FIELD(REG_SET_FIELD(0, COMPUTE_PGM_RSRC1, VGPRS, HK_VGPRS), COMPUTE_PGM_RSRC1, SGPRS, HK_SGPRS), COMPUTE_PGM_RSRC1, DX10_CLAMP, 1);
+	u32 r2 = REG_SET_FIELD(0, COMPUTE_PGM_RSRC2, USER_SGPR, HK_USER_SGPR);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_PGM_RSRC1) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = r1; ib.ptr[ib.length_dw++] = r2; }
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_STATIC_THREAD_MGMT_SE0) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = 0xffffffff; ib.ptr[ib.length_dw++] = 0xffffffff;
+	pgm_addr = (ib.gpu_addr + shader_off) >> 8;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_PGM_LO) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = lower_32_bits(pgm_addr); ib.ptr[ib.length_dw++] = upper_32_bits(pgm_addr);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_USER_DATA_0) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = lower_32_bits(mb_gpu_addr); ib.ptr[ib.length_dw++] = upper_32_bits(mb_gpu_addr);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_DISPATCH_DIRECT, 3);
+	ib.ptr[ib.length_dw++] = 1; ib.ptr[ib.length_dw++] = 1; ib.ptr[ib.length_dw++] = 1;
+	ib.ptr[ib.length_dw++] = REG_SET_FIELD(0, COMPUTE_DISPATCH_INITIATOR, COMPUTE_SHADER_EN, 1);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_EVENT_WRITE, 0);
+	ib.ptr[ib.length_dw++] = EVENT_TYPE(7) | EVENT_INDEX(4);
+
+	ret = amdgpu_ib_schedule(kring, 1, &ib, NULL, &_fence);
+	amdgpu_ib_free(adev, &ib, NULL);
+	if (ret) goto out_free_bo;
+
+	ret = dma_fence_wait_timeout(_fence, false, msecs_to_jiffies(10000));
+	dma_fence_put(_fence);
+	if (ret <= 0) { ret = -ETIMEDOUT; goto out_free_bo; }
+
+	/* Copy result to userspace */
+	if (copy_to_user((void __user *)req.result_ptr, mb_cpu,
+			 min_t(u32, req.result_size, 4096))) {
+		ret = -EFAULT;
+		goto out_free_bo;
+	}
+
+	pr_info("hk: ioctl: done, result copied to user\n");
+	ret = 0;
+
+out_free_bo:
+	amdgpu_bo_free_kernel(&mb_bo, &mb_gpu_addr, &mb_cpu);
+out_free_shader:
+	kfree(shader_copy);
+	return ret;
+}
+
+static const struct file_operations hk_fops = {
+	.owner          = THIS_MODULE,
+	.unlocked_ioctl = hk_ioctl,
+	.compat_ioctl   = hk_ioctl,
+};
+
+static struct miscdevice hk_miscdev = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name  = "heteroken",
+	.fops  = &hk_fops,
+};
+
+/* ==========================================================================
  * Module init/exit
  * ========================================================================== */
 static struct kobject *hk_kobj;
 
 static int __init hk_init(void)
 {
+	int ret;
 	pr_info("hk: HeteroKern ready (gfx902, phases 1-3)\n");
 	hk_kobj = kobject_create_and_add("heteroken", kernel_kobj);
 	if (!hk_kobj) return -ENOMEM;
@@ -615,11 +760,15 @@ static int __init hk_init(void)
 	if (sysfs_create_file(hk_kobj, &stop_attr.attr))   pr_warn("hk: stop failed\n");
 	if (sysfs_create_file(hk_kobj, &hello_attr.attr))  pr_warn("hk: hello failed\n");
 	if (sysfs_create_file(hk_kobj, &result_attr.attr)) pr_warn("hk: result failed\n");
+	ret = misc_register(&hk_miscdev);
+	if (ret) pr_warn("hk: misc_register failed: %d\n", ret);
+	else pr_info("hk: /dev/heteroken registered\n");
 	return 0;
 }
 
 static void __exit hk_exit(void)
 {
+	misc_deregister(&hk_miscdev);
 	if (hk_spawned_task) {
 		wake_up_process(hk_spawned_task);
 		kthread_stop(hk_spawned_task);
