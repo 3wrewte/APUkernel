@@ -284,21 +284,27 @@ read back by CPU via kernel compute ring + IB dispatch.
 ### Phase 3: Clone Hook + GCN Task Birth [IN PROGRESS — 4-6 days]
 
 **P3 core lifecycle verified (2026-06-16)** via kthread: `sleep → GPU → IH → wake → CPU → repeat`.
-The only difference from final clone3 design is task_struct origin (kthread vs clone3).
+**P3 userspace API verified (2026-06-16)** via `/dev/heteroken` char device + `host_runner.c`.
+**P3 mailbox syscall verified (2026-06-16)** via dispatch loop: GPU requests write(), CPU executes kernel_write().
 
-**Architecture**: The dispatch layer is swappable — `hk_dispatch_ctx()` encapsulates
-kernel compute ring + IB. When KFD queue path works, only this function changes.
+**Architecture decisions** (see `docs/architecture-decisions.md` for details):
+- clone3(CLONE_GCN) deferred — current approach: `fork()` + ioctl(`/dev/heteroken`)
+- Dispatch loop (s_endpgm per syscall) instead of s_sendmsg(INTERRUPT) — pragmatic for now
+- mailbox.step counter simulates "program counter" across re-dispatches
+- Each syscall = one full dispatch cycle (IB → GPU → s_endpgm → fence → CPU → re-dispatch)
 
 | # | Task | Verification |
 |---|------|-------------|
 | 3.1 | `struct hk_gcn_ctx` — mailbox BO, fence_cb, owning task pointer | Compiles + boots ✅ |
-| 3.2 | `hk_dispatch_ctx()` — refactored dispatch with pre-allocated mailbox, fence callback → `wake_up_process()` | IH wakes task ✅ |
+| 3.2 | `hk_dispatch_ctx()` — dispatch with pre-allocated mailbox, fence callback → `wake_up_process()` | IH wakes task ✅ |
 | 3.3 | `hk_gcn_thread()` — kthread lifecycle: submit → sleep → wake → loop → stop | 50+ iterations ✅ |
 | 3.4 | sysfs `spawn` / `stop` nodes — create and destroy GCN kthreads | Clean start/stop ✅ |
-| 3.5 | Define `CLONE_GCN` flag + clone3 hook in `kernel/fork.c` | Pending |
-| 3.6 | Hook `copy_process()`: detect `CLONE_GCN` → call `hk_clone_gcn_callback` | Pending |
-| 3.7 | Post-clone: allocate mailbox, submit dispatch via `hk_dispatch_ctx()`, task → UNINTERRUPTIBLE | Pending |
-| 3.8 | Test: real user-space task created via clone3, runs on GPU, exits | Pending |
+| 3.5 | `/dev/heteroken` char device + `HK_IOCTL_RUN` — userspace API | host_runner ✅ |
+| 3.6 | `host_runner.c` — `./host_runner shader.co` → fork → ioctl → result | "hello from CU" ✅ |
+| 3.7 | Mailbox syscall protocol: GPU writes syscall_nr+args, CPU executes, re-dispatches | write() called from GPU ✅ |
+| 3.8 | Dispatch loop (16 rounds max): fresh IB per round, fence wait, syscall execution | kernel_write(stdout) ✅ |
+| 3.9 | Multi-phase shader with step counter (write once + exit) | Pending |
+| 3.10 | Define `CLONE_GCN` flag + clone3 hook in `kernel/fork.c` | Deferred (fork+ioctl works) |
 
 ### Phase 4: CoW Semantics + Address Space [ONLINE — 3-5 days]
 
@@ -574,3 +580,10 @@ APUkernel/
 | 2026-06-16 | 3 | **Verified**: 50+ GPU→CPU cycles without failure, mailbox data correct, clean exit | ✅ |
 | 2026-06-16 | 3 | **hello_string shader**: GCN writes "hello from CU\n" to GPU memory, CPU reads via sysfs `/result` | ✅ |
 | 2026-06-16 | 3 | `host_runner.sh` + `hello`/`result` sysfs nodes: GPU hello world end-to-end | ✅ |
+| 2026-06-16 | 3 | `/dev/heteroken` char device + `HK_IOCTL_RUN`: userspace API for arbitrary .co shaders | ✅ |
+| 2026-06-16 | 3 | `host_runner.c` (C): fork → child ioctl(HK_IOCTL_RUN, shader.co) → waitpid | ✅ |
+| 2026-06-16 | 3 | **hello_string.co via host_runner**: "hello from CU" printed from GPU-written data | ✅ |
+| 2026-06-16 | 3 | **hello_syscall.co**: GPU requests write(1,...) via mailbox, CPU executes kernel_write() | ✅ |
+| 2026-06-16 | 3 | Dispatch loop: fresh IB per round, fence wait, syscall dispatch, re-dispatch (16 rounds) | ✅ |
+| 2026-06-16 | 3 | Bug fix: VGPR count too low (4→8) for shaders using v4 register | ✅ |
+| 2026-06-16 | — | docs/architecture-decisions.md: s_endpgm vs s_sendmsg, KFD queue blocker, VMID 0 vs 8 | ✅ |
