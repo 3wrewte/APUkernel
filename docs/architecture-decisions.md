@@ -44,13 +44,13 @@ permanently mapped during driver initialization.
 
 ## 2. Syscall Notification: s_endpgm vs s_sendmsg(INTERRUPT)
 
-### Decision: Use s_endpgm for now; plan migration to s_sendmsg later
+### Decision: Use s_sendmsg for syscall boundaries; keep s_endpgm for final exit
 
 **Context**: A GCN wavefront needs to notify the CPU that it has written
 syscall parameters to the mailbox and is waiting for the CPU to execute
 the syscall.
 
-#### Option A: s_endpgm (current approach)
+#### Option A: s_endpgm (old/fallback approach)
 
 ```
 Wavefront:
@@ -79,39 +79,51 @@ knows the wavefront wrote anything. `flat_store` is just a memory write —
 it doesn't trigger any notification. The CPU would have to poll, which
 wastes CPU cycles.
 
-#### Option B: s_sendmsg sendmsg(INTERRUPT)
+#### Option B: s_sendmsg sendmsg(INTERRUPT) (current approach)
 
 ```
 Wavefront:
   1. Write syscall_nr + args to mailbox
-  2. s_sendmsg sendmsg(INTERRUPT)       ← notify CP, wavefront stays alive!
+  2. s_sendmsg sendmsg(INTERRUPT)       ← trap/interrupt, wavefront stays alive
   3. Busy-wait: flat_load mailbox.state until CPU clears it
   4. flat_load mailbox.retval           ← read return value
   5. Continue to next instruction        ← registers preserved!
 ```
 
-**Why not yet**:
+**Verified on 2026-06-22**:
 
-1. **Trap handler setup**: `s_sendmsg(INTERRUPT)` in compute shaders requires
-   `COMPUTE_PGM_RSRC2.TRAP_PRESENT = 1` and a trap handler at the TBA
-   (Trap Base Address) register. We haven't set up CWSR trap handlers.
+1. `s_sendmsg sendmsg(MSG_INTERRUPT)` assembles on gfx902 as `0xBF900001`.
 
-2. **IH interrupt routing**: Even if the interrupt fires, it goes through
-   amdgpu's IH ring buffer handler. We'd need to hook into the IH processing
-   chain to route "shader interrupt" events to our module.
+2. Without trap setup, `s_sendmsg` stops the wavefront. `sendmsg_exit.co`
+   timed out with `state=0` forever, proving the instruction does not simply
+   fall through under default PM4 state.
 
-3. **CU resource waste**: The wavefront occupies a CU SIMD slot while
-   busy-waiting. For a 5ms CPU syscall latency, one wavefront wastes
-   ~5ms of CU time. On a GPU designed for high-throughput parallel
-   execution, this is significant.
+3. Minimal trap setup is sufficient for fall-through:
+   - Set `COMPUTE_PGM_RSRC2.TRAP_PRESENT = 1`
+   - Program `SQ_SHADER_TBA_LO/HI` to a trap handler in the same IB
+   - Trap handler body:
+     ```asm
+     s_mov_b64 s[0:1], ttmp[0:1]
+     s_rfe_b64 s[0:1]
+     ```
 
-4. **Unknown availability on GFX9 compute**: Need to verify that
-   `s_sendmsg(INTERRUPT)` actually works in compute dispatch mode on
-   gfx902 (Raven Ridge). Documentation is sparse for this use case.
+4. CPU→GPU mailbox return requires GPU-side cache invalidation. The live
+   shader must execute `buffer_wbinvl1_vol` before polling `mailbox.state`;
+   otherwise it keeps reading stale `state=1` and never observes the CPU's
+   `state=0` write.
 
-**Plan**: Migrate to `s_sendmsg(INTERRUPT)` after CWSR infrastructure
-(Phase 5) is in place. The trap handler and TBA setup from CWSR are
-prerequisites.
+5. Full live syscall proof works:
+   - GPU writes `write(1, "hello from CU\n", 14)` request
+   - GPU executes `s_sendmsg(MSG_INTERRUPT)` and returns through TBA handler
+   - CPU polling path sees `state=1`, calls `kernel_write()`, writes retval,
+     clears state, flushes mailbox fields
+   - GPU invalidates cache, sees `state=0`, continues, writes `state=3`,
+     and exits via final `s_endpgm`
+
+**Remaining limitation**: The CPU currently polls the mailbox. We have proven
+the GPU-side live-wavefront semantics, but have not yet routed the `s_sendmsg`
+event through amdgpu IH to wake a sleeping CPU task. That is now the next
+interrupt-routing task; it no longer blocks correctness of syscall return.
 
 ---
 
@@ -259,7 +271,7 @@ the wavefront will fault on register access.
 | Decision | Current | Target | Prerequisite |
 |----------|---------|--------|-------------|
 | Dispatch path | Kernel ring + IB (VMID 0) | KFD queue (VMID 8) | KIQ MAP_QUEUES |
-| Syscall notification | s_endpgm + dispatch loop | s_sendmsg(INTERRUPT) | CWSR trap handler |
+| Syscall notification | s_sendmsg + trap return + CPU polling | IH-routed wakeup | amdgpu IH hook |
 | Task creation | fork() + ioctl | clone3(CLONE_GCN) | Core kernel hook |
 | Memory model | Mailbox BO (kernel memory) | User-space SVM | VMID 8 |
-| Step tracking | mailbox.step counter | Hardware register state | s_sendmsg path |
+| Step tracking | Hardware register state across syscall | Same | Done for live-wavefront path |

@@ -8,7 +8,7 @@
 // For Phase B, this is a minimal skeleton — full save/restore
 // comes in Phase F (context.c).
 
-	.amdgcn_target "amdgcn-amd-amdhsa--gfx700"
+	.amdgcn_target "amdgcn-amd-amdhsa--gfx902"
 
 	.text
 
@@ -56,12 +56,12 @@ trap_handler_notify:
 	v_mov_b32_e32 v3, ttmp1
 
 	// fault_addr at mailbox offset 0x48
-	v_add_i32_e32 v4, vcc, 0x48, v0
+	v_add_u32_e32 v4, 0x48, v0
 	flat_store_dwordx2 v[4:5], v[2:3]
 
 	// fault_type = 2 (exec) at offset 0x50
 	v_mov_b32_e32 v2, 2
-	v_add_i32_e32 v4, vcc, 0x50, v0
+	v_add_u32_e32 v4, 0x50, v0
 	flat_store_dword v[4:5], v2
 
 	s_waitcnt     vmcnt(0)

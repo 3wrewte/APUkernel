@@ -4,7 +4,7 @@
 // Provides low-level GCN assembly helpers for communicating with
 // the x86 kernel via the shared mailbox protocol.  All functions
 // receive the mailbox base address as a 64-bit flat pointer in
-// v[0:1] and use v_add_i32_e32 for small offset arithmetic
+// v[0:1] and use v_add_u32_e32 for small offset arithmetic
 // (small offsets never overflow the low 32 bits on page-aligned
 // pointers, so carry propagation is unnecessary).
 //
@@ -18,7 +18,7 @@
 //   +0x50: fault_type  (uint32_t)
 //   +0x54: reserved[44]
 
-	.amdgcn_target "amdgcn-amd-amdhsa--gfx700"
+	.amdgcn_target "amdgcn-amd-amdhsa--gfx902"
 
 //
 // mailbox_signal(mailbox_ptr)
@@ -60,7 +60,7 @@ mailbox_set_state:
 	.type	mailbox_read_retval,@function
 
 mailbox_read_retval:
-	v_add_i32_e32 v0, vcc, 0x38, v0
+	v_add_u32_e32 v0, 0x38, v0
 	flat_load_dwordx2 v[2:3], v[0:1]
 	s_waitcnt     vmcnt(0)
 	v_mov_b32_e32 v0, v2
@@ -102,7 +102,7 @@ mailbox_write_syscall:
 	v_mov_b32_e32 v4, v1    // save base high
 
 	// syscall_nr at offset 4
-	v_add_i32_e32 v0, vcc, 4, v0
+	v_add_u32_e32 v0, 4, v0
 	flat_store_dword v[0:1], v2
 
 	// state at offset 0
@@ -133,17 +133,17 @@ mailbox_write_args:
 	v_mov_b32_e32  v2, v0          // save base lo
 	v_mov_b32_e32  v3, v1          // save base hi
 
-	v_add_i32_e32  v0, vcc, 0x08, v2
+	v_add_u32_e32  v0, 0x08, v2
 	flat_store_dwordx2 v[0:1], v[4:5]
-	v_add_i32_e32  v0, vcc, 0x10, v2
+	v_add_u32_e32  v0, 0x10, v2
 	flat_store_dwordx2 v[0:1], v[6:7]
-	v_add_i32_e32  v0, vcc, 0x18, v2
+	v_add_u32_e32  v0, 0x18, v2
 	flat_store_dwordx2 v[0:1], v[8:9]
-	v_add_i32_e32  v0, vcc, 0x20, v2
+	v_add_u32_e32  v0, 0x20, v2
 	flat_store_dwordx2 v[0:1], v[10:11]
-	v_add_i32_e32  v0, vcc, 0x28, v2
+	v_add_u32_e32  v0, 0x28, v2
 	flat_store_dwordx2 v[0:1], v[12:13]
-	v_add_i32_e32  v0, vcc, 0x30, v2
+	v_add_u32_e32  v0, 0x30, v2
 	flat_store_dwordx2 v[0:1], v[14:15]
 
 	s_waitcnt      vmcnt(0)
@@ -166,11 +166,11 @@ mailbox_report_fault:
 	v_mov_b32_e32  v6, v1          // save base hi
 
 	// fault_addr at offset 0x48
-	v_add_i32_e32  v0, vcc, 0x48, v5
+	v_add_u32_e32  v0, 0x48, v5
 	flat_store_dwordx2 v[0:1], v[2:3]
 
 	// fault_type at offset 0x50
-	v_add_i32_e32  v0, vcc, 0x50, v5
+	v_add_u32_e32  v0, 0x50, v5
 	flat_store_dword v[0:1], v4
 
 	s_waitcnt      vmcnt(0)

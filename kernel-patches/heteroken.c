@@ -29,6 +29,8 @@
 #include <linux/uaccess.h>
 #include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/delay.h>
+#include <drm/drm_cache.h>
 
 #include "kfd_priv.h"
 #include "../amdgpu/amdgpu_amdkfd.h"
@@ -91,6 +93,12 @@ static const uint32_t mailbox_shader[] = {
 	0x7E0402FF, 0xCAFEBABE,    /* v2=0xCAFEBABE → arg1 */
 	0xDC700000, 0x00000200,
 	0xBF810000,                /* s_endpgm */
+};
+
+/* Minimal trap handler: return immediately from MSG_INTERRUPT trap. */
+static const uint32_t trap_return_shader[] = {
+	0xBE80016C, /* s_mov_b64 s[0:1], ttmp[0:1] */
+	0xBE801F00, /* s_rfe_b64 s[0:1] */
 };
 #define MAGIC 0x21544148
 
@@ -636,8 +644,8 @@ static long hk_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	struct dma_fence *_fence = NULL;
 	struct amdgpu_bo *mb_bo = NULL;
 	void *mb_cpu = NULL;
-	u64 mb_gpu_addr, pgm_addr;
-	u32 shader_off = 256, total_size;
+	u64 mb_gpu_addr, pgm_addr, tba_addr;
+	u32 trap_off = 256, shader_off = 512, total_size;
 	uint32_t *shader_copy = NULL;
 	int ret;
 
@@ -675,62 +683,74 @@ static long hk_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	/* Shader area size (used for all rounds) */
 	total_size = shader_off + ALIGN(req.shader_size, 256);
 
-	/* --- Dispatch loop: GPU writes syscall request → CPU executes --- */
-	for (int round = 0; round < 16; round++) {
-		/* Fresh IB each round */
-		memset(&ib, 0, sizeof(ib));
-		ret = amdgpu_ib_get(adev, NULL, total_size,
+	/* Single dispatch: live-wavefront syscall path uses s_sendmsg + polling. */
+	memset(&ib, 0, sizeof(ib));
+	ret = amdgpu_ib_get(adev, NULL, total_size,
 				    AMDGPU_IB_POOL_DIRECT, &ib);
-		if (ret) goto out_free_bo;
-		memset(ib.ptr, 0, total_size / 4);
-		memcpy(ib.ptr + shader_off / 4, shader_copy, req.shader_size);
+	if (ret) goto out_free_bo;
+	memset(ib.ptr, 0, total_size / 4);
+	memcpy(ib.ptr + trap_off / 4, trap_return_shader,
+	       sizeof(trap_return_shader));
+	memcpy(ib.ptr + shader_off / 4, shader_copy, req.shader_size);
 
-		/* Build PM4 */
-		ib.length_dw = 0;
-		ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 1);
-		ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_RESOURCE_LIMITS) - PACKET3_SET_SH_REG_START; ib.ptr[ib.length_dw++] = 0;
-		ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 3);
-		ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_NUM_THREAD_X) - PACKET3_SET_SH_REG_START;
-		ib.ptr[ib.length_dw++] = HK_THREADS; ib.ptr[ib.length_dw++] = 1; ib.ptr[ib.length_dw++] = 1;
-		{ u32 r1 = REG_SET_FIELD(REG_SET_FIELD(REG_SET_FIELD(0, COMPUTE_PGM_RSRC1, VGPRS, HK_VGPRS), COMPUTE_PGM_RSRC1, SGPRS, HK_SGPRS), COMPUTE_PGM_RSRC1, DX10_CLAMP, 1);
-		u32 r2 = REG_SET_FIELD(0, COMPUTE_PGM_RSRC2, USER_SGPR, HK_USER_SGPR);
-		ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
-		ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_PGM_RSRC1) - PACKET3_SET_SH_REG_START;
-		ib.ptr[ib.length_dw++] = r1; ib.ptr[ib.length_dw++] = r2; }
-		ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
-		ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_STATIC_THREAD_MGMT_SE0) - PACKET3_SET_SH_REG_START;
-		ib.ptr[ib.length_dw++] = 0xffffffff; ib.ptr[ib.length_dw++] = 0xffffffff;
-		pgm_addr = (ib.gpu_addr + shader_off) >> 8;
-		ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
-		ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_PGM_LO) - PACKET3_SET_SH_REG_START;
-		ib.ptr[ib.length_dw++] = lower_32_bits(pgm_addr); ib.ptr[ib.length_dw++] = upper_32_bits(pgm_addr);
-		ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
-		ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_USER_DATA_0) - PACKET3_SET_SH_REG_START;
-		ib.ptr[ib.length_dw++] = lower_32_bits(mb_gpu_addr); ib.ptr[ib.length_dw++] = upper_32_bits(mb_gpu_addr);
-		ib.ptr[ib.length_dw++] = PACKET3(PACKET3_DISPATCH_DIRECT, 3);
-		ib.ptr[ib.length_dw++] = 1; ib.ptr[ib.length_dw++] = 1; ib.ptr[ib.length_dw++] = 1;
-		ib.ptr[ib.length_dw++] = REG_SET_FIELD(0, COMPUTE_DISPATCH_INITIATOR, COMPUTE_SHADER_EN, 1);
-		ib.ptr[ib.length_dw++] = PACKET3(PACKET3_EVENT_WRITE, 0);
-		ib.ptr[ib.length_dw++] = EVENT_TYPE(7) | EVENT_INDEX(4);
+	/* Build PM4 */
+	ib.length_dw = 0;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 1);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_RESOURCE_LIMITS) - PACKET3_SET_SH_REG_START; ib.ptr[ib.length_dw++] = 0;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 3);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_NUM_THREAD_X) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = HK_THREADS; ib.ptr[ib.length_dw++] = 1; ib.ptr[ib.length_dw++] = 1;
+	{ u32 r1 = REG_SET_FIELD(REG_SET_FIELD(REG_SET_FIELD(0, COMPUTE_PGM_RSRC1, VGPRS, HK_VGPRS), COMPUTE_PGM_RSRC1, SGPRS, HK_SGPRS), COMPUTE_PGM_RSRC1, DX10_CLAMP, 1);
+	u32 r2 = REG_SET_FIELD(0, COMPUTE_PGM_RSRC2, USER_SGPR, HK_USER_SGPR);
+	r2 = REG_SET_FIELD(r2, COMPUTE_PGM_RSRC2, TRAP_PRESENT, 1);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_PGM_RSRC1) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = r1; ib.ptr[ib.length_dw++] = r2; }
+	tba_addr = (ib.gpu_addr + trap_off) >> 8;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 4);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmSQ_SHADER_TBA_LO) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = lower_32_bits(tba_addr);
+	ib.ptr[ib.length_dw++] = upper_32_bits(tba_addr);
+	ib.ptr[ib.length_dw++] = 0;
+	ib.ptr[ib.length_dw++] = 0;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_STATIC_THREAD_MGMT_SE0) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = 0xffffffff; ib.ptr[ib.length_dw++] = 0xffffffff;
+	pgm_addr = (ib.gpu_addr + shader_off) >> 8;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_PGM_LO) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = lower_32_bits(pgm_addr); ib.ptr[ib.length_dw++] = upper_32_bits(pgm_addr);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_USER_DATA_0) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = lower_32_bits(mb_gpu_addr); ib.ptr[ib.length_dw++] = upper_32_bits(mb_gpu_addr);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_DISPATCH_DIRECT, 3);
+	ib.ptr[ib.length_dw++] = 1; ib.ptr[ib.length_dw++] = 1; ib.ptr[ib.length_dw++] = 1;
+	ib.ptr[ib.length_dw++] = REG_SET_FIELD(0, COMPUTE_DISPATCH_INITIATOR, COMPUTE_SHADER_EN, 1);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_EVENT_WRITE, 0);
+	ib.ptr[ib.length_dw++] = EVENT_TYPE(7) | EVENT_INDEX(4);
 
-		ret = amdgpu_ib_schedule(kring, 1, &ib, NULL, &_fence);
+	ret = amdgpu_ib_schedule(kring, 1, &ib, NULL, &_fence);
+	if (ret) {
 		amdgpu_ib_free(adev, &ib, NULL);
-		if (ret) goto out_free_bo;
+		goto out_free_bo;
+	}
 
-		ret = dma_fence_wait_timeout(_fence, false, msecs_to_jiffies(10000));
-		dma_fence_put(_fence);
-		if (ret <= 0) { ret = -ETIMEDOUT; goto out_free_bo; }
-
+	for (int poll = 0; poll < 10000; poll++) {
 		/* Read mailbox state */
 		u32 *mb32 = mb_cpu;
-		u32 state = mb32[0];
-		u32 syscall_nr = mb32[2];
+		u32 state = READ_ONCE(mb32[0]);
+		u32 syscall_nr = READ_ONCE(mb32[2]);
 
-		pr_info("hk: round %d: state=%u syscall=%u\n", round, state, syscall_nr);
+		if (state || (poll % 1000) == 0)
+			pr_info("hk: poll %d: state=%u syscall=%u fence=%d\n",
+				poll, state, syscall_nr,
+				dma_fence_is_signaled(_fence));
 
 		if (state == 0) {
-			/* Pure data output (no syscall), copy and return */
-			break;
+			if (dma_fence_is_signaled(_fence))
+				break;
+			msleep(1);
+			continue;
 		}
 
 		if (state == 1) {
@@ -762,18 +782,31 @@ static long hk_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 			}
 
 			*(u64 *)&mb32[14] = retval;
-			mb32[0] = 0;
+			drm_clflush_virt_range(&mb32[14], sizeof(u64));
+			smp_wmb();
+			WRITE_ONCE(mb32[0], 0);
+			drm_clflush_virt_range(&mb32[0], sizeof(u32));
+			wmb();
 			pr_info("hk: syscall returned %lld\n", retval);
 			continue;
 		}
 
 		if (state == 3) {
 			pr_info("hk: GCN task requested exit\n");
-			break;
+			if (dma_fence_is_signaled(_fence))
+				break;
+			msleep(1);
+			continue;
 		}
 
 		break; /* unknown state */
 	}
+
+	ret = dma_fence_wait_timeout(_fence, false, msecs_to_jiffies(1000));
+	dma_fence_put(_fence);
+	_fence = NULL;
+	amdgpu_ib_free(adev, &ib, NULL);
+	if (ret <= 0) { ret = -ETIMEDOUT; goto out_free_bo; }
 
 	/* Copy result to userspace */
 	if (copy_to_user((void __user *)req.result_ptr, mb_cpu,

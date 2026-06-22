@@ -12,7 +12,7 @@ LLD        ?= $(ROCM_PATH)/bin/ld.lld
 OBJDUMP    ?= $(ROCM_PATH)/bin/llvm-objdump
 OBJCOPY    ?= $(ROCM_PATH)/bin/llvm-objcopy
 
-GCN_CFLAGS  = --target=amdgcn-amd-amdhsa -mcpu=gfx700
+GCN_CFLAGS  = --target=amdgcn-amd-amdhsa -mcpu=gfx902
 GCN_CFLAGS += --rocm-path=$(ROCM_PATH)
 GCN_CFLAGS += -ffreestanding -nostdlib -nostdinc
 
@@ -29,6 +29,7 @@ BLD_KERNEL = build/kernel
 GCN_ASM_SRCS  = $(wildcard gcn/*.S)
 GCN_ASM_OBJS  = $(GCN_ASM_SRCS:gcn/%.S=$(BLD_GCN)/%.o)
 GCN_HSACOS    = $(GCN_ASM_OBJS:.o=.hsaco)
+GCN_COS       = $(GCN_HSACOS:.hsaco=.co)
 
 GCN_C_SRCS    = $(wildcard gcn/*.c)
 GCN_C_OBJS    = $(GCN_C_SRCS:gcn/%.c=$(BLD_GCN)/%.o)
@@ -41,7 +42,7 @@ all: gcn
 
 # ── GCN targets ──────────────────────────────────────────────
 
-gcn: $(GCN_HSACOS)
+gcn: $(GCN_HSACOS) $(GCN_COS)
 
 $(BLD_GCN)/%.o: gcn/%.S | $(BLD_GCN)
 	$(CLANG) $(GCN_CFLAGS) -c -o $@ $<
@@ -51,6 +52,9 @@ $(BLD_GCN)/%.o: gcn/%.c | $(BLD_GCN)
 
 $(BLD_GCN)/%.hsaco: $(BLD_GCN)/%.o | $(BLD_GCN)
 	$(LLD) $(LDFLAGS_GCN) $< -o $@
+
+$(BLD_GCN)/%.co: $(BLD_GCN)/%.hsaco | $(BLD_GCN)
+	$(OBJCOPY) -O binary -j .text $< $@
 
 $(BLD_GCN)/%.ll: gcn/%.c | $(BLD_GCN)
 	$(CLANG) $(GCN_CFLAGS) -S -emit-llvm -o $@ $<

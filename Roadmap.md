@@ -286,12 +286,13 @@ read back by CPU via kernel compute ring + IB dispatch.
 **P3 core lifecycle verified (2026-06-16)** via kthread: `sleep → GPU → IH → wake → CPU → repeat`.
 **P3 userspace API verified (2026-06-16)** via `/dev/heteroken` char device + `host_runner.c`.
 **P3 mailbox syscall verified (2026-06-16)** via dispatch loop: GPU requests write(), CPU executes kernel_write().
+**P3 live-wavefront syscall verified (2026-06-22)** via `s_sendmsg(MSG_INTERRUPT)` + trap return + GPU cache invalidate.
 
 **Architecture decisions** (see `docs/architecture-decisions.md` for details):
 - clone3(CLONE_GCN) deferred — current approach: `fork()` + ioctl(`/dev/heteroken`)
-- Dispatch loop (s_endpgm per syscall) instead of s_sendmsg(INTERRUPT) — pragmatic for now
-- mailbox.step counter simulates "program counter" across re-dispatches
-- Each syscall = one full dispatch cycle (IB → GPU → s_endpgm → fence → CPU → re-dispatch)
+- `s_sendmsg(MSG_INTERRUPT)` is now the syscall boundary; `s_endpgm` is only final program exit/fallback
+- Minimal TBA trap handler (`s_mov_b64 s[0:1], ttmp[0:1]`; `s_rfe_b64 s[0:1]`) returns to the live wavefront
+- GPU polling loop requires `buffer_wbinvl1_vol` before `flat_load state` to observe CPU mailbox writes
 
 | # | Task | Verification |
 |---|------|-------------|
@@ -303,8 +304,9 @@ read back by CPU via kernel compute ring + IB dispatch.
 | 3.6 | `host_runner.c` — `./host_runner shader.co` → fork → ioctl → result | "hello from CU" ✅ |
 | 3.7 | Mailbox syscall protocol: GPU writes syscall_nr+args, CPU executes, re-dispatches | write() called from GPU ✅ |
 | 3.8 | Dispatch loop (16 rounds max): fresh IB per round, fence wait, syscall execution | kernel_write(stdout) ✅ |
-| 3.9 | Multi-phase shader with step counter (write once + exit) | Pending |
-| 3.10 | Define `CLONE_GCN` flag + clone3 hook in `kernel/fork.c` | Deferred (fork+ioctl works) |
+| 3.9 | `s_sendmsg(MSG_INTERRUPT)` trap path: set `TRAP_PRESENT`, program `SQ_SHADER_TBA`, return via `s_rfe_b64` | `sendmsg_exit.co` ✅ |
+| 3.10 | Live-wavefront syscall return: GPU requests write(), CPU clears state, GPU observes and continues | `sendmsg_live.co` ✅ |
+| 3.11 | Define `CLONE_GCN` flag + clone3 hook in `kernel/fork.c` | Deferred (fork+ioctl works) |
 
 ### Phase 4: CoW Semantics + Address Space [ONLINE — 3-5 days]
 
@@ -587,3 +589,8 @@ APUkernel/
 | 2026-06-16 | 3 | Dispatch loop: fresh IB per round, fence wait, syscall dispatch, re-dispatch (16 rounds) | ✅ |
 | 2026-06-16 | 3 | Bug fix: VGPR count too low (4→8) for shaders using v4 register | ✅ |
 | 2026-06-16 | — | docs/architecture-decisions.md: s_endpgm vs s_sendmsg, KFD queue blocker, VMID 0 vs 8 | ✅ |
+| 2026-06-22 | 3 | `sendmsg_exit.co`: `s_sendmsg(MSG_INTERRUPT)` requires `TRAP_PRESENT` + `SQ_SHADER_TBA`; minimal `s_rfe_b64` handler returns | ✅ |
+| 2026-06-22 | 3 | `/dev/heteroken` ioctl now embeds trap handler in IB and keeps IB alive until final fence | ✅ |
+| 2026-06-22 | 3 | `sendmsg_live.co`: live wavefront requests `write(1, "hello from CU\n", 14)`, CPU executes, GPU resumes and exits | ✅ |
+| 2026-06-22 | 3 | GPU polling fix: `buffer_wbinvl1_vol` before mailbox `flat_load` is required to observe CPU-cleared state | ✅ |
+| 2026-06-22 | 3 | Compatibility smoke test: sysfs `hello` and `run` still pass on kernel `#99` | ✅ |

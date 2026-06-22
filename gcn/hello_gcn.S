@@ -6,13 +6,13 @@
 // Writes the magic value 0x21544148 ("HAT!") to that address,
 // then terminates cleanly.
 //
-// Build: clang --target=amdgcn-amd-amdhsa -mcpu=gfx700 -c -o hello_gcn.o hello_gcn.S
+// Build: clang --target=amdgcn-amd-amdhsa -mcpu=gfx902 -c -o hello_gcn.o hello_gcn.S
 // Link:  ld.lld -shared hello_gcn.o -o hello_gcn.hsaco
 //
 // This is the primitive that the entire mailbox protocol is built on:
 // prove a GCN kernel can write to a memory location the x86 side reads.
 
-	.amdgcn_target "amdgcn-amd-amdhsa--gfx700"
+	.amdgcn_target "amdgcn-amd-amdhsa--gfx902"
 	.text
 	.globl	hello_gcn
 	.p2align 8
