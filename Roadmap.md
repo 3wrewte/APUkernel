@@ -594,3 +594,10 @@ APUkernel/
 | 2026-06-22 | 3 | `sendmsg_live.co`: live wavefront requests `write(1, "hello from CU\n", 14)`, CPU executes, GPU resumes and exits | ✅ |
 | 2026-06-22 | 3 | GPU polling fix: `buffer_wbinvl1_vol` before mailbox `flat_load` is required to observe CPU-cleared state | ✅ |
 | 2026-06-22 | 3 | Compatibility smoke test: sysfs `hello` and `run` still pass on kernel `#99` | ✅ |
+| 2026-06-23 | 3 | `multi_syscall.co`: 3 consecutive write() calls from one wavefront, registers survive across s_sendmsg | ✅ |
+| 2026-06-23 | 4 | `HK_IOCTL_COMPUTE`: extended ioctl with input/output BO allocation, configurable dispatch grid + VGPR count | ✅ |
+| 2026-06-23 | 4 | Mailbox copy-in: kernel copies user mailbox data into BO before dispatch (width, height, etc.) | ✅ |
+| 2026-06-23 | 4 | `vec_scale.co`: GPU vector scaling (64 elements × 2), verified against CPU reference | ✅ |
+| 2026-06-23 | 4 | `conv_test.co`: 3x3 edge detection convolution on 64x64 grayscale image, 61 workgroups × 64 threads | ✅ |
+| 2026-06-23 | 4 | Convolution result: all 3844 pixels match CPU reference exactly | ✅ |
+| 2026-06-23 | 4 | GPU→CPU cache flush: `drm_clflush_virt_range` required for mailbox + input BO before dispatch | ✅ |

@@ -46,3 +46,4 @@ scripts/
 *.log
 .cache/
 __pycache__/
+resources/

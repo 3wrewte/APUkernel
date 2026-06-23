@@ -108,6 +108,35 @@ static const uint32_t trap_return_shader[] = {
 #define HK_USER_SGPR 2
 #define HK_THREADS   64
 
+/*
+ * Extended mailbox layout (shared between GPU and CPU):
+ *   +0x00: state        (u32)   0=idle, 1=syscall_pending, 3=exit
+ *   +0x04: reserved
+ *   +0x08: syscall_nr   (u32)
+ *   +0x0C: reserved
+ *   +0x10: arg0         (u64)   fd for write()
+ *   +0x18: arg1         (u64)
+ *   +0x20: arg2         (u64)   count for write()
+ *   +0x28: arg3         (u64)
+ *   +0x30: arg4         (u64)
+ *   +0x38: retval       (u64)
+ *   +0x40: data[128]            string/data buffer (0x40 - 0xBF)
+ *   +0xC0: input_addr   (u64)   GPU address of input BO
+ *   +0xC8: output_addr  (u64)   GPU address of output BO
+ *   +0xD0: width        (u32)
+ *   +0xD4: height       (u32)
+ *   +0xD8: input_size   (u32)
+ *   +0xDC: output_size  (u32)
+ *
+ * Minimum mailbox BO size: 4096 bytes (PAGE_SIZE).
+ */
+#define HK_MB_INPUT_ADDR   0xC0
+#define HK_MB_OUTPUT_ADDR  0xC8
+#define HK_MB_WIDTH        0xD0
+#define HK_MB_HEIGHT       0xD4
+#define HK_MB_INPUT_SIZE   0xD8
+#define HK_MB_OUTPUT_SIZE  0xDC
+
 /* Mailbox structure (shared between GPU and CPU) */
 struct hk_mailbox {
 	uint32_t magic;
@@ -626,6 +655,7 @@ static struct kobj_attribute hello_attr = __ATTR_WO(hello);
  *   4. child returns with result, parent waitpid()
  * ========================================================================== */
 #define HK_IOCTL_RUN _IOWR('H', 1, struct hk_run_req)
+#define HK_IOCTL_COMPUTE _IOWR('H', 2, struct hk_compute_req)
 
 struct hk_run_req {
 	__u64 shader_ptr;    /* user pointer to raw shader dwords */
@@ -634,6 +664,23 @@ struct hk_run_req {
 	__u64 result_ptr;    /* user pointer for result output */
 	__u32 result_size;   /* bytes available */
 };
+
+struct hk_compute_req {
+	__u64 shader_ptr;     /* raw shader binary */
+	__u32 shader_size;    /* bytes */
+	__u32 vgprs;          /* VGPR field for RSRC1 (0=>1) */
+	__u64 input_ptr;      /* user input data (NULL=none) */
+	__u32 input_size;     /* input bytes (0=none) */
+	__u32 dispatch_x;     /* grid X (0=>1) */
+	__u64 output_ptr;     /* user output buffer (NULL=none) */
+	__u32 output_size;    /* output bytes (0=none) */
+	__u32 dispatch_y;     /* grid Y (0=>1) */
+	__u64 mailbox_ptr;    /* user mailbox output (NULL=skip copy) */
+	__u32 mailbox_size;   /* mailbox BO size (min 4096) */
+	__u32 tgid_en;        /* 1=enable workgroup ID SGPRs */
+};
+
+static long hk_ioctl_compute(struct file *f, unsigned int cmd, unsigned long arg);
 
 static long hk_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
@@ -653,7 +700,10 @@ static long hk_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	kring = &adev->gfx.compute_ring[0];
 	if (!kring->sched.ready) return -ENODEV;
 
-	if (cmd != HK_IOCTL_RUN) return -EINVAL;
+	if (cmd != HK_IOCTL_RUN && cmd != HK_IOCTL_COMPUTE) return -EINVAL;
+
+	if (cmd == HK_IOCTL_COMPUTE)
+		return hk_ioctl_compute(f, cmd, arg);
 
 	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
 		return -EFAULT;
@@ -818,9 +868,270 @@ static long hk_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	pr_info("hk: ioctl: done, result copied to user\n");
 	ret = 0;
 
-out_free_bo:
+ out_free_bo:
 	amdgpu_bo_free_kernel(&mb_bo, &mb_gpu_addr, &mb_cpu);
-out_free_shader:
+ out_free_shader:
+	kfree(shader_copy);
+	return ret;
+}
+
+/* ==========================================================================
+ * HK_IOCTL_COMPUTE — extended ioctl with input/output BO support
+ *
+ * Allocates separate BOs for user-supplied input and output data,
+ * writes their GPU addresses into the mailbox, and supports configurable
+ * dispatch grid size and VGPR count for compute shaders.
+ * ========================================================================== */
+
+static long hk_ioctl_compute(struct file *f, unsigned int cmd, unsigned long arg)
+{
+	struct amdgpu_device *adev = hk_get_adev();
+	struct amdgpu_ring *kring;
+	struct hk_compute_req req;
+	struct amdgpu_ib ib;
+	struct dma_fence *_fence = NULL;
+	struct amdgpu_bo *mb_bo = NULL, *in_bo = NULL, *out_bo = NULL;
+	void *mb_cpu = NULL, *in_cpu = NULL, *out_cpu = NULL;
+	u64 mb_gpu_addr = 0, in_gpu_addr = 0, out_gpu_addr = 0;
+	u64 pgm_addr, tba_addr;
+	u32 trap_off = 256, shader_off = 512, total_size;
+	u32 vgprs, dispatch_x, dispatch_y;
+	uint32_t *shader_copy = NULL;
+	int ret;
+
+	if (!adev) return -ENODEV;
+	kring = &adev->gfx.compute_ring[0];
+	if (!kring->sched.ready) return -ENODEV;
+
+	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+		return -EFAULT;
+	if (req.shader_size == 0 || req.shader_size > 4096)
+		return -EINVAL;
+
+	shader_copy = kmalloc(req.shader_size, GFP_KERNEL);
+	if (!shader_copy) return -ENOMEM;
+	if (copy_from_user(shader_copy, (void __user *)req.shader_ptr,
+			   req.shader_size)) {
+		ret = -EFAULT;
+		goto out_free_shader;
+	}
+
+	/* Allocate mailbox BO (always 4096 for full layout) */
+	ret = amdgpu_bo_create_kernel(adev, max_t(u32, req.mailbox_size, 4096),
+				      PAGE_SIZE, AMDGPU_GEM_DOMAIN_GTT,
+				      &mb_bo, &mb_gpu_addr, &mb_cpu);
+	if (ret) goto out_free_shader;
+	memset(mb_cpu, 0, max_t(u32, req.mailbox_size, 4096));
+
+	/* Copy initial mailbox data from user (width, height, etc.) */
+	if (req.mailbox_ptr && req.mailbox_size > 0) {
+		if (copy_from_user(mb_cpu, (void __user *)req.mailbox_ptr,
+				   min_t(u32, req.mailbox_size, 4096))) {
+			ret = -EFAULT;
+			goto out_free_mb;
+		}
+	}
+
+	/* Allocate input BO and copy user data */
+	if (req.input_size > 0 && req.input_ptr) {
+		ret = amdgpu_bo_create_kernel(adev, req.input_size, PAGE_SIZE,
+					      AMDGPU_GEM_DOMAIN_GTT,
+					      &in_bo, &in_gpu_addr, &in_cpu);
+		if (ret) goto out_free_mb;
+		if (copy_from_user(in_cpu, (void __user *)req.input_ptr,
+				   req.input_size)) {
+			ret = -EFAULT;
+			goto out_free_in;
+		}
+		*(u64 *)((char *)mb_cpu + HK_MB_INPUT_ADDR) = in_gpu_addr;
+		*(u32 *)((char *)mb_cpu + HK_MB_INPUT_SIZE) = req.input_size;
+		drm_clflush_virt_range(in_cpu, req.input_size);
+		wmb();
+	}
+
+	/* Allocate output BO (zeroed) */
+	if (req.output_size > 0 && req.output_ptr) {
+		ret = amdgpu_bo_create_kernel(adev, req.output_size, PAGE_SIZE,
+					      AMDGPU_GEM_DOMAIN_GTT,
+					      &out_bo, &out_gpu_addr, &out_cpu);
+		if (ret) goto out_free_in;
+		memset(out_cpu, 0, req.output_size);
+		*(u64 *)((char *)mb_cpu + HK_MB_OUTPUT_ADDR) = out_gpu_addr;
+		*(u32 *)((char *)mb_cpu + HK_MB_OUTPUT_SIZE) = req.output_size;
+	}
+
+	pr_info("hk: compute: shader=%u in=%u out=%u grid=%ux%u\n",
+		req.shader_size, req.input_size, req.output_size,
+		req.dispatch_x ? req.dispatch_x : 1,
+		req.dispatch_y ? req.dispatch_y : 1);
+
+	/* Flush mailbox so GPU sees input/output addresses */
+	drm_clflush_virt_range(mb_cpu, max_t(u32, req.mailbox_size, 4096));
+	wmb();
+
+	vgprs = req.vgprs ? req.vgprs : HK_VGPRS;
+	dispatch_x = req.dispatch_x ? req.dispatch_x : 1;
+	dispatch_y = req.dispatch_y ? req.dispatch_y : 1;
+
+	/* Build IB */
+	total_size = shader_off + ALIGN(req.shader_size, 256);
+	memset(&ib, 0, sizeof(ib));
+	ret = amdgpu_ib_get(adev, NULL, total_size, AMDGPU_IB_POOL_DIRECT, &ib);
+	if (ret) goto out_free_out;
+	memset(ib.ptr, 0, total_size / 4);
+	memcpy(ib.ptr + trap_off / 4, trap_return_shader,
+	       sizeof(trap_return_shader));
+	memcpy(ib.ptr + shader_off / 4, shader_copy, req.shader_size);
+
+	/* Build PM4 */
+	ib.length_dw = 0;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 1);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_RESOURCE_LIMITS) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = 0;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 3);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_NUM_THREAD_X) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = HK_THREADS; ib.ptr[ib.length_dw++] = 1; ib.ptr[ib.length_dw++] = 1;
+	{
+		u32 r1 = REG_SET_FIELD(0, COMPUTE_PGM_RSRC1, VGPRS, vgprs);
+		r1 = REG_SET_FIELD(r1, COMPUTE_PGM_RSRC1, SGPRS, HK_SGPRS);
+		r1 = REG_SET_FIELD(r1, COMPUTE_PGM_RSRC1, DX10_CLAMP, 1);
+		u32 r2 = REG_SET_FIELD(0, COMPUTE_PGM_RSRC2, USER_SGPR, HK_USER_SGPR);
+		r2 = REG_SET_FIELD(r2, COMPUTE_PGM_RSRC2, TRAP_PRESENT, 1);
+		if (req.tgid_en)
+			r2 = REG_SET_FIELD(r2, COMPUTE_PGM_RSRC2, TGID_X_EN, 1);
+		ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+		ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_PGM_RSRC1) - PACKET3_SET_SH_REG_START;
+		ib.ptr[ib.length_dw++] = r1; ib.ptr[ib.length_dw++] = r2;
+	}
+	tba_addr = (ib.gpu_addr + trap_off) >> 8;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 4);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmSQ_SHADER_TBA_LO) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = lower_32_bits(tba_addr);
+	ib.ptr[ib.length_dw++] = upper_32_bits(tba_addr);
+	ib.ptr[ib.length_dw++] = 0;
+	ib.ptr[ib.length_dw++] = 0;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_STATIC_THREAD_MGMT_SE0) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = 0xffffffff; ib.ptr[ib.length_dw++] = 0xffffffff;
+	pgm_addr = (ib.gpu_addr + shader_off) >> 8;
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_PGM_LO) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = lower_32_bits(pgm_addr); ib.ptr[ib.length_dw++] = upper_32_bits(pgm_addr);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_USER_DATA_0) - PACKET3_SET_SH_REG_START;
+	ib.ptr[ib.length_dw++] = lower_32_bits(mb_gpu_addr); ib.ptr[ib.length_dw++] = upper_32_bits(mb_gpu_addr);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_DISPATCH_DIRECT, 3);
+	ib.ptr[ib.length_dw++] = dispatch_x; ib.ptr[ib.length_dw++] = dispatch_y; ib.ptr[ib.length_dw++] = 1;
+	ib.ptr[ib.length_dw++] = REG_SET_FIELD(0, COMPUTE_DISPATCH_INITIATOR, COMPUTE_SHADER_EN, 1);
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_EVENT_WRITE, 0);
+	ib.ptr[ib.length_dw++] = EVENT_TYPE(7) | EVENT_INDEX(4);
+
+	ret = amdgpu_ib_schedule(kring, 1, &ib, NULL, &_fence);
+	if (ret) {
+		amdgpu_ib_free(adev, &ib, NULL);
+		goto out_free_out;
+	}
+
+	/* Poll loop (same as HK_IOCTL_RUN) */
+	for (int poll = 0; poll < 10000; poll++) {
+		u32 *mb32 = mb_cpu;
+		u32 state = READ_ONCE(mb32[0]);
+		u32 syscall_nr = READ_ONCE(mb32[2]);
+
+		if (state || (poll % 1000) == 0)
+			pr_info("hk: compute poll %d: state=%u syscall=%u fence=%d\n",
+				poll, state, syscall_nr,
+				dma_fence_is_signaled(_fence));
+
+		if (state == 0) {
+			if (dma_fence_is_signaled(_fence))
+				break;
+			msleep(1);
+			continue;
+		}
+
+		if (state == 1) {
+			u64 arg0 = *(u64 *)&mb32[4];
+			u64 arg2 = *(u64 *)&mb32[8];
+			char *data = (char *)&mb32[16];
+			s64 retval = 0;
+
+			pr_info("hk: compute syscall %u(fd=%lld, count=%lld)\n",
+				syscall_nr, arg0, arg2);
+
+			switch (syscall_nr) {
+			case 1: {
+				struct fd fdfd = fdget((int)arg0);
+				if (!fd_empty(fdfd)) {
+					loff_t pos = 0;
+					retval = kernel_write(fd_file(fdfd), data,
+							      (size_t)arg2, &pos);
+					fdput(fdfd);
+				} else
+					retval = -EBADF;
+				break;
+			}
+			default:
+				retval = -ENOSYS;
+				break;
+			}
+
+			*(u64 *)&mb32[14] = retval;
+			drm_clflush_virt_range(&mb32[14], sizeof(u64));
+			smp_wmb();
+			WRITE_ONCE(mb32[0], 0);
+			drm_clflush_virt_range(&mb32[0], sizeof(u32));
+			wmb();
+			pr_info("hk: compute syscall returned %lld\n", retval);
+			continue;
+		}
+
+		if (state == 3) {
+			if (dma_fence_is_signaled(_fence))
+				break;
+			msleep(1);
+			continue;
+		}
+		break;
+	}
+
+	ret = dma_fence_wait_timeout(_fence, false, msecs_to_jiffies(1000));
+	dma_fence_put(_fence);
+	_fence = NULL;
+	amdgpu_ib_free(adev, &ib, NULL);
+	if (ret <= 0) { ret = -ETIMEDOUT; goto out_free_out; }
+
+	pr_info("hk: compute: GPU done, copying results\n");
+
+	/* Copy output BO to user */
+	if (out_cpu && req.output_ptr) {
+		drm_clflush_virt_range(out_cpu, req.output_size);
+		if (copy_to_user((void __user *)req.output_ptr, out_cpu,
+				 req.output_size)) {
+			ret = -EFAULT;
+			goto out_free_out;
+		}
+	}
+
+	/* Copy mailbox to user */
+	if (req.mailbox_ptr && req.mailbox_size > 0) {
+		if (copy_to_user((void __user *)req.mailbox_ptr, mb_cpu,
+				 min_t(u32, req.mailbox_size, 4096))) {
+			ret = -EFAULT;
+			goto out_free_out;
+		}
+	}
+
+	pr_info("hk: compute: done\n");
+	ret = 0;
+
+ out_free_out:
+	amdgpu_bo_free_kernel(&out_bo, &out_gpu_addr, &out_cpu);
+ out_free_in:
+	amdgpu_bo_free_kernel(&in_bo, &in_gpu_addr, &in_cpu);
+ out_free_mb:
+	amdgpu_bo_free_kernel(&mb_bo, &mb_gpu_addr, &mb_cpu);
+ out_free_shader:
 	kfree(shader_copy);
 	return ret;
 }
