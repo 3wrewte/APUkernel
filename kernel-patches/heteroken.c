@@ -109,6 +109,22 @@ static const uint32_t trap_return_shader[] = {
 #define HK_THREADS   64
 
 /*
+ * For C-compiled shaders (HK_IOCTL_COMPUTE): allocate a scratch BO and
+ * set up USER_DATA so that:
+ *   s[0:3] = scratch buffer resource descriptor (4 dwords)
+ *   s[4:5] = mailbox base address
+ *   USER_SGPR = 6
+ * This prevents the C compiler's prologue from corrupting the mailbox
+ * (the compiler uses s[0:3] as a scratch buffer descriptor).
+ *
+ * For hand-written assembly shaders (HK_IOCTL_RUN): keep the old layout:
+ *   s[0:1] = mailbox base address
+ *   USER_SGPR = 2
+ */
+#define HK_SCRATCH_SIZE   (64 * 1024)   /* 64 KB scratch BO */
+#define HK_USER_SGPR_C    6             /* C mode: 6 USER_DATA SGPRs */
+
+/*
  * Extended mailbox layout (shared between GPU and CPU):
  *   +0x00: state        (u32)   0=idle, 1=syscall_pending, 3=exit
  *   +0x04: reserved
@@ -948,9 +964,9 @@ static long hk_ioctl_compute(struct file *f, unsigned int cmd, unsigned long arg
 	struct hk_compute_req req;
 	struct amdgpu_ib ib;
 	struct dma_fence *_fence = NULL;
-	struct amdgpu_bo *mb_bo = NULL, *in_bo = NULL, *out_bo = NULL;
-	void *mb_cpu = NULL, *in_cpu = NULL, *out_cpu = NULL;
-	u64 mb_gpu_addr = 0, in_gpu_addr = 0, out_gpu_addr = 0;
+	struct amdgpu_bo *mb_bo = NULL, *in_bo = NULL, *out_bo = NULL, *scr_bo = NULL;
+	void *mb_cpu = NULL, *in_cpu = NULL, *out_cpu = NULL, *scr_cpu = NULL;
+	u64 mb_gpu_addr = 0, in_gpu_addr = 0, out_gpu_addr = 0, scr_gpu_addr = 0;
 	u64 pgm_addr, tba_addr;
 	u32 trap_off = 256, shader_off = 512, total_size;
 	u32 vgprs, dispatch_x, dispatch_y;
@@ -1018,6 +1034,16 @@ static long hk_ioctl_compute(struct file *f, unsigned int cmd, unsigned long arg
 		*(u32 *)((char *)mb_cpu + HK_MB_OUTPUT_SIZE) = req.output_size;
 	}
 
+	/* Allocate scratch BO for C compiler stack spills */
+	{
+		ret = amdgpu_bo_create_kernel(adev, HK_SCRATCH_SIZE, PAGE_SIZE,
+					      AMDGPU_GEM_DOMAIN_GTT,
+					      &scr_bo, &scr_gpu_addr, &scr_cpu);
+		if (ret) goto out_free_out;
+		memset(scr_cpu, 0, HK_SCRATCH_SIZE);
+		drm_clflush_virt_range(scr_cpu, HK_SCRATCH_SIZE);
+	}
+
 	pr_info("hk: compute: shader=%u in=%u out=%u grid=%ux%u\n",
 		req.shader_size, req.input_size, req.output_size,
 		req.dispatch_x ? req.dispatch_x : 1,
@@ -1051,10 +1077,12 @@ static long hk_ioctl_compute(struct file *f, unsigned int cmd, unsigned long arg
 	ib.ptr[ib.length_dw++] = HK_THREADS; ib.ptr[ib.length_dw++] = 1; ib.ptr[ib.length_dw++] = 1;
 	{
 		u32 r1 = REG_SET_FIELD(0, COMPUTE_PGM_RSRC1, VGPRS, vgprs);
-		r1 = REG_SET_FIELD(r1, COMPUTE_PGM_RSRC1, SGPRS, HK_SGPRS);
+		r1 = REG_SET_FIELD(r1, COMPUTE_PGM_RSRC1, SGPRS, 7); /* 64 SGPRs */
 		r1 = REG_SET_FIELD(r1, COMPUTE_PGM_RSRC1, DX10_CLAMP, 1);
-		u32 r2 = REG_SET_FIELD(0, COMPUTE_PGM_RSRC2, USER_SGPR, HK_USER_SGPR);
+		u32 r2 = REG_SET_FIELD(0, COMPUTE_PGM_RSRC2, USER_SGPR, HK_USER_SGPR_C);
 		r2 = REG_SET_FIELD(r2, COMPUTE_PGM_RSRC2, TRAP_PRESENT, 1);
+		/* SCRATCH_EN disabled for now — test without it */
+		/* r2 = REG_SET_FIELD(r2, COMPUTE_PGM_RSRC2, SCRATCH_EN, 1); */
 		if (req.tgid_en)
 			r2 = REG_SET_FIELD(r2, COMPUTE_PGM_RSRC2, TGID_X_EN, 1);
 		ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
@@ -1075,9 +1103,16 @@ static long hk_ioctl_compute(struct file *f, unsigned int cmd, unsigned long arg
 	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
 	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_PGM_LO) - PACKET3_SET_SH_REG_START;
 	ib.ptr[ib.length_dw++] = lower_32_bits(pgm_addr); ib.ptr[ib.length_dw++] = upper_32_bits(pgm_addr);
-	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 2);
+	/* USER_DATA: s[0:3]=scratch V#, s[4:5]=mailbox addr.
+	 * Use mailbox BO as scratch for debugging (known GPU-accessible) */
+	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_SET_SH_REG, 6);
 	ib.ptr[ib.length_dw++] = SOC15_REG_OFFSET(GC, 0, mmCOMPUTE_USER_DATA_0) - PACKET3_SET_SH_REG_START;
-	ib.ptr[ib.length_dw++] = lower_32_bits(mb_gpu_addr); ib.ptr[ib.length_dw++] = upper_32_bits(mb_gpu_addr);
+	ib.ptr[ib.length_dw++] = lower_32_bits(mb_gpu_addr);
+	ib.ptr[ib.length_dw++] = upper_32_bits(mb_gpu_addr) & 0xFFFF;
+	ib.ptr[ib.length_dw++] = 0x00004FFF;
+	ib.ptr[ib.length_dw++] = 0x00024444;
+	ib.ptr[ib.length_dw++] = lower_32_bits(mb_gpu_addr);
+	ib.ptr[ib.length_dw++] = upper_32_bits(mb_gpu_addr);
 	ib.ptr[ib.length_dw++] = PACKET3(PACKET3_DISPATCH_DIRECT, 3);
 	ib.ptr[ib.length_dw++] = dispatch_x; ib.ptr[ib.length_dw++] = dispatch_y; ib.ptr[ib.length_dw++] = 1;
 	ib.ptr[ib.length_dw++] = REG_SET_FIELD(0, COMPUTE_DISPATCH_INITIATOR, COMPUTE_SHADER_EN, 1);
@@ -1087,12 +1122,14 @@ static long hk_ioctl_compute(struct file *f, unsigned int cmd, unsigned long arg
 	ret = amdgpu_ib_schedule(kring, 1, &ib, NULL, &_fence);
 	if (ret) {
 		amdgpu_ib_free(adev, &ib, NULL);
-		goto out_free_out;
+		goto out_free_scratch;
 	}
 
 	/* Poll loop (same as HK_IOCTL_RUN) */
 	for (int poll = 0; poll < 10000; poll++) {
 		u32 *mb32 = mb_cpu;
+		/* Invalidate CPU cache to see GPU writes */
+		drm_clflush_virt_range(mb_cpu, 64);
 		u32 state = READ_ONCE(mb32[0]);
 		u32 syscall_nr = READ_ONCE(mb32[2]);
 
@@ -1108,12 +1145,23 @@ static long hk_ioctl_compute(struct file *f, unsigned int cmd, unsigned long arg
 			continue;
 		}
 
- 		if (state == 1) {
+  		if (state == 1) {
 			u64 arg0 = *(u64 *)&mb32[4];   /* +0x10: fd */
 			u64 arg1 = *(u64 *)&mb32[6];   /* +0x18: buffer addr */
 			u64 arg2 = *(u64 *)&mb32[8];   /* +0x20: count */
 			char *data = (char *)&mb32[16];
 			s64 retval = 0;
+			struct hk_bo_map maps[4];
+			int nmaps = 0;
+
+			/* IB mapping: shader code+data (for string literals etc.) */
+			maps[nmaps].gpu_addr = ib.gpu_addr + shader_off;
+			maps[nmaps].cpu_addr = (void *)((char *)ib.ptr + shader_off);
+			maps[nmaps].size = total_size - shader_off;
+			nmaps++;
+			if (out_bo) { maps[nmaps].gpu_addr = out_gpu_addr; maps[nmaps].cpu_addr = out_cpu; maps[nmaps].size = req.output_size; nmaps++; }
+			if (in_bo)  { maps[nmaps].gpu_addr = in_gpu_addr;  maps[nmaps].cpu_addr = in_cpu;  maps[nmaps].size = req.input_size;  nmaps++; }
+			maps[nmaps].gpu_addr = mb_gpu_addr; maps[nmaps].cpu_addr = mb_cpu; maps[nmaps].size = 4096; nmaps++;
 
 			pr_info("hk: compute syscall %u(fd=%lld, buf=0x%llx, count=%lld)\n",
 				syscall_nr, arg0, arg1, arg2);
@@ -1122,35 +1170,15 @@ static long hk_ioctl_compute(struct file *f, unsigned int cmd, unsigned long arg
 			case 0: { /* SYS_read — CPU reads into GPU BO */
 				struct fd fdfd = fdget((int)arg0);
 				if (!fd_empty(fdfd)) {
-					struct hk_bo_map maps[3];
-					int nmaps = 0;
-					if (out_bo) {
-						maps[nmaps].gpu_addr = out_gpu_addr;
-						maps[nmaps].cpu_addr = out_cpu;
-						maps[nmaps].size = req.output_size;
-						nmaps++;
-					}
-					if (in_bo) {
-						maps[nmaps].gpu_addr = in_gpu_addr;
-						maps[nmaps].cpu_addr = in_cpu;
-						maps[nmaps].size = req.input_size;
-						nmaps++;
-					}
-					maps[nmaps].gpu_addr = mb_gpu_addr;
-					maps[nmaps].cpu_addr = mb_cpu;
-					maps[nmaps].size = 4096;
-					nmaps++;
-					{
-						void *buf = hk_translate(arg1, maps, nmaps);
-						if (buf) {
-							loff_t pos = 0;
-							retval = kernel_read(fd_file(fdfd), buf,
-									     (size_t)arg2, &pos);
-							if (retval > 0)
-								drm_clflush_virt_range(buf, retval);
-						} else
-							retval = -EFAULT;
-					}
+					void *buf = hk_translate(arg1, maps, nmaps);
+					if (buf) {
+						loff_t pos = 0;
+						retval = kernel_read(fd_file(fdfd), buf,
+								     (size_t)arg2, &pos);
+						if (retval > 0)
+							drm_clflush_virt_range(buf, retval);
+					} else
+						retval = -EFAULT;
 					fdput(fdfd);
 				} else
 					retval = -EBADF;
@@ -1160,14 +1188,8 @@ static long hk_ioctl_compute(struct file *f, unsigned int cmd, unsigned long arg
 				struct fd fdfd = fdget((int)arg0);
 				if (!fd_empty(fdfd)) {
 					char *wdata = data;
-					if (arg1) {
-						struct hk_bo_map wmaps[3];
-						int wn = 0;
-						if (out_bo) { wmaps[wn].gpu_addr = out_gpu_addr; wmaps[wn].cpu_addr = out_cpu; wmaps[wn].size = req.output_size; wn++; }
-						if (in_bo)  { wmaps[wn].gpu_addr = in_gpu_addr;  wmaps[wn].cpu_addr = in_cpu;  wmaps[wn].size = req.input_size;  wn++; }
-						wmaps[wn].gpu_addr = mb_gpu_addr; wmaps[wn].cpu_addr = mb_cpu; wmaps[wn].size = 4096; wn++;
-						wdata = hk_translate(arg1, wmaps, wn);
-					}
+					if (arg1)
+						wdata = hk_translate(arg1, maps, nmaps);
 					if (wdata) {
 						loff_t pos = 0;
 						retval = kernel_write(fd_file(fdfd), wdata,
@@ -1233,6 +1255,8 @@ static long hk_ioctl_compute(struct file *f, unsigned int cmd, unsigned long arg
 	pr_info("hk: compute: done\n");
 	ret = 0;
 
+ out_free_scratch:
+	amdgpu_bo_free_kernel(&scr_bo, &scr_gpu_addr, &scr_cpu);
  out_free_out:
 	amdgpu_bo_free_kernel(&out_bo, &out_gpu_addr, &out_cpu);
  out_free_in:

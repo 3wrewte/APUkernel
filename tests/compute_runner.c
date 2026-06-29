@@ -428,8 +428,9 @@ int main(int argc, char *argv[])
             "  %s vec_scale <shader.co>\n"
             "  %s multi_syscall <shader.co>\n"
             "  %s conv <shader.co> <width> <height> <input.pgm>\n"
-            "  %s read <shader.co> <file>\n",
-            argv[0], argv[0], argv[0], argv[0]);
+            "  %s read <shader.co> <file>\n"
+            "  %s cprog <shader.co>\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
 
@@ -457,6 +458,39 @@ int main(int argc, char *argv[])
             return 1;
         }
         return test_read(argv[2], argv[3]);
+    }
+
+    if (strcmp(argv[1], "cprog") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "cprog needs: <shader.co>\n");
+            return 1;
+        }
+        size_t sh_sz;
+        unsigned char *sh = read_file(argv[2], &sh_sz);
+        if (!sh) return 1;
+        unsigned char mailbox[4096];
+        memset(mailbox, 0, sizeof(mailbox));
+
+        int hkfd = open("/dev/heteroken", O_RDWR);
+        if (hkfd < 0) { perror("open /dev/heteroken"); free(sh); return 1; }
+
+        struct hk_compute_req req = {
+            .shader_ptr  = (unsigned long long)sh,
+            .shader_size = sh_sz,
+            .vgprs       = 11,  /* 48 VGPRs for C-compiled code */
+            .dispatch_x  = 1,
+            .dispatch_y  = 1,
+            .mailbox_ptr = (unsigned long long)mailbox,
+            .mailbox_size= sizeof(mailbox),
+        };
+        printf("running C program (%zu bytes)...\n", sh_sz);
+        fflush(stdout);
+        int ret = ioctl(hkfd, HK_IOCTL_COMPUTE, &req);
+        if (ret < 0)
+            fprintf(stderr, "ioctl failed: %s\n", strerror(errno));
+        close(hkfd);
+        free(sh);
+        return ret < 0 ? 1 : 0;
     }
 
     fprintf(stderr, "Unknown test: %s\n", argv[1]);
