@@ -36,7 +36,7 @@ GCN_C_OBJS    = $(GCN_C_SRCS:gcn/%.c=$(BLD_GCN)/%.o)
 
 # ── Phonies ───────────────────────────────────────────────────
 
-.PHONY: all clean gcn kernel dump dump-all check-tools
+.PHONY: all clean gcn kernel dump dump-all check-tools sdk
 
 all: gcn
 
@@ -93,6 +93,56 @@ clean:
 
 distclean: clean
 	rm -rf build
+
+# ── SDK package ──────────────────────────────────────────────
+#
+# Packages everything a developer needs to write and run GCN C
+# programs into build/sdk/:
+#
+#   build/sdk/
+#   ├── include/hk_libc.h   — C library (read/write/exit, all inline)
+#   ├── lib/hk.ld            — linker script (merges sections)
+#   ├── bin/hk-compile       — one-command compiler wrapper
+#   ├── examples/hello.c     — "hello world" sample
+#   ├── host/compute_runner.c — host-side runner (compile on target)
+#   └── README.md            — quick-start guide
+
+SDK_DIR = build/sdk
+
+sdk:
+	rm -rf $(SDK_DIR)
+	mkdir -p $(SDK_DIR)/include $(SDK_DIR)/lib $(SDK_DIR)/bin \
+	         $(SDK_DIR)/examples $(SDK_DIR)/host
+	cp include/hk_libc.h $(SDK_DIR)/include/
+	cp gcn/hk.ld         $(SDK_DIR)/lib/
+	cp tests/gcn/hello_c.c  $(SDK_DIR)/examples/hello.c
+	cp tests/compute_runner.c $(SDK_DIR)/host/
+	@# --- Generate hk-compile ---
+	@echo '#!/bin/bash' > $(SDK_DIR)/bin/hk-compile
+	@echo '# hk-compile — compile a C file to a HeteroKern GCN .co binary' >> $(SDK_DIR)/bin/hk-compile
+	@echo '# Usage: hk-compile program.c [-o output.co]' >> $(SDK_DIR)/bin/hk-compile
+	@echo '# Env:  CLANG (default: $$$(CLANG))' >> $(SDK_DIR)/bin/hk-compile
+	@echo '#       LLD   (default: $$$(LLD))' >> $(SDK_DIR)/bin/hk-compile
+	@echo '#       OBJCOPY (default: $$$(OBJCOPY))' >> $(SDK_DIR)/bin/hk-compile
+	@echo '' >> $(SDK_DIR)/bin/hk-compile
+	@echo 'set -e' >> $(SDK_DIR)/bin/hk-compile
+	@echo 'CLANG="$${CLANG:-$(CLANG)}"' >> $(SDK_DIR)/bin/hk-compile
+	@echo 'LLD="$${LLD:-$(LLD)}"' >> $(SDK_DIR)/bin/hk-compile
+	@echo 'OBJCOPY="$${OBJCOPY:-$(OBJCOPY)}"' >> $(SDK_DIR)/bin/hk-compile
+	@echo 'SDK_DIR="$$(cd "$$(dirname "$$0")/.." && pwd)"' >> $(SDK_DIR)/bin/hk-compile
+	@echo 'CFLAGS="--target=amdgcn-amd-amdhsa -mcpu=gfx902 -O2 -ffreestanding -nostdlib -nostdinc -I $${SDK_DIR}/include"' >> $(SDK_DIR)/bin/hk-compile
+	@echo 'SRC=$$1; shift' >> $(SDK_DIR)/bin/hk-compile
+	@echo 'OUT=""' >> $(SDK_DIR)/bin/hk-compile
+	@echo 'while [ $$# -gt 0 ]; do case $$1 in -o) shift; OUT=$$1;; esac; shift; done' >> $(SDK_DIR)/bin/hk-compile
+	@echo '[ -n "$$OUT" ] || OUT="$${SRC%.c}.co"' >> $(SDK_DIR)/bin/hk-compile
+	@echo 'TMP=$$(mktemp -d)' >> $(SDK_DIR)/bin/hk-compile
+	@echo 'trap "rm -rf $$TMP" EXIT' >> $(SDK_DIR)/bin/hk-compile
+	@echo '$$CLANG $$CFLAGS -c "$$SRC" -o "$$TMP/a.o"' >> $(SDK_DIR)/bin/hk-compile
+	@echo '$$LLD -T "$${SDK_DIR}/lib/hk.ld" "$$TMP/a.o" -o "$$TMP/a.hsaco"' >> $(SDK_DIR)/bin/hk-compile
+	@echo '$$OBJCOPY -O binary -j .text "$$TMP/a.hsaco" "$$OUT"' >> $(SDK_DIR)/bin/hk-compile
+	@echo 'echo "Built $$OUT ($$(wc -c < $$OUT) bytes)"' >> $(SDK_DIR)/bin/hk-compile
+	@chmod +x $(SDK_DIR)/bin/hk-compile
+	@echo "SDK packaged in $(SDK_DIR)/"
 
 # ── Toolchain check ──────────────────────────────────────────
 

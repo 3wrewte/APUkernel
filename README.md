@@ -3,89 +3,124 @@
 **GCN tasks as first-class Linux processes on AMD APU.**
 
 HeteroKern makes GPU compute units a native execution target for Linux
-processes. A `clone3(CLONE_GCN)` call creates a real `task_struct` whose
-wavefront runs on a GCN CU — same pid, same address space, same file
-descriptors. The kernel's scheduler, syscall handlers, and fault handlers
-remain unmodified.
+processes. A GCN wavefront runs on a Vega CU — same pid, same file
+descriptors, same syscalls (`read`, `write`, `exit`). The kernel's scheduler,
+syscall handlers, and fault handlers remain unmodified.
 
-## Motivation
+## Quick Start
 
-Modern APUs ship with GPU compute units that sit idle during general
-computation. To use them, programmers must write explicit offload code with
-domain-specific SDKs (CUDA, HIP, OpenCL). HeteroKern asks: **what if a GCN CU
-were just another core the scheduler knows about?**
+### Write a GCN program in C
 
-The goal is to let any C program spawn threads that run transparently on
-either x86 or GCN cores — no explicit offload, no driver, no SDK. A
-`clone3()` with `CLONE_GCN` is all it takes.
+```c
+#include "hk_libc.h"
 
-## Architecture
+static inline __attribute__((always_inline))
+void hk_main(volatile void *mb, void *input, void *output,
+             int width, int height)
+{
+    hk_write(mb, 1, "hello from GCN C!\n", 18);
+    hk_exit(mb, 0);
+}
 
-```
-  clone3(CLONE_GCN, &entry)
-    │
-    ├─ copy_process() → normal CoW mm, fd table, creds
-    ├─ Allocate mailbox + HSA signal
-    ├─ Submit AQL packet → wavefront starts on CU
-    └─ Task sleeps (TASK_UNINTERRUPTIBLE on CFS runqueue)
-
-         ┌─── Wavefront on CU ────────────────────────┐
-         │  ... executes GCN code ...                  │
-         │  Needs syscall → write mailbox, ring doorbell│
-         └──────────────────────────────────────────────┘
-                          │
-         IH interrupt → xarray lookup → wake_up_process()
-                          │
-         ┌─── GCN task on CPU (CFS schedules it) ─────┐
-         │  do_syscall_64(nr, args...)  ← unmodified  │
-         │  Write result → re-arm signal → re-dispatch │
-         │  Task sleeps again                          │
-         └──────────────────────────────────────────────┘
-
-  Signals: CWSR queue unmap (GFX9) → preempt wave → shadow context
-  Faults:  IOMMUv2 PPR → handle_mm_fault() on task's mm → XNACK retry
+HK_ENTRY
 ```
 
-- **Unmodified**: core scheduler, `do_syscall_64()`, page fault handler, signal
-  delivery infrastructure
-- **Kernel module owns**: clone hook, mailbox/doorbell service, AQL dispatch,
-  CWSR bridge, `/sys` topology
-- **SVM**: CPU and GPU share one virtual address space — no data copies
+### Compile and run
+
+```bash
+# Package the SDK (on ROCm build host)
+make sdk
+
+# Compile a program
+build/sdk/bin/hk-compile my_program.c -o my_program.co
+
+# Run on target (2200G with HeteroKern kernel)
+./compute_runner cprog my_program.co
+```
+
+The GPU calls `write(stdout, "hello from GCN C!", 18)` via the mailbox
+syscall protocol — no explicit data transfer, no driver API calls.
+
+## How It Works
+
+```
+  C source                →  clang -O2  →  GCN binary (.co)
+       │                                        │
+  hk_write()            inlined into        flat_store + s_sendmsg
+  hk_read()             one function         + buffer_wbinvl1_vol
+  hk_exit()                                 + s_endpgm
+                                                │
+                                    ┌───────────┘
+                                    ▼
+              ┌─── Wavefront on CU ──────────────────┐
+              │  flat_store mailbox: syscall_nr, args │
+              │  s_sendmsg(MSG_INTERRUPT)             │
+              │  → trap handler → s_rfe_b64 → return  │
+              │  poll mailbox.state until CPU clears   │
+              │  flat_load mailbox.retval              │
+              │  ... continue executing ...            │
+              └────────────────────────────────────────┘
+                               │
+              ┌─── CPU (kernel ioctl) ──────────────────┐
+              │  Poll mailbox for state=SYSCALL_PENDING │
+              │  Execute: kernel_read / kernel_write    │
+              │  Write retval, clear state, flush cache │
+              └─────────────────────────────────────────┘
+```
+
+The wavefront **stays alive** across syscalls — registers and PC are
+preserved. `s_sendmsg(MSG_INTERRUPT)` triggers a trap; the minimal trap
+handler (`s_rfe_b64`) returns to the next instruction. The CPU polls the
+mailbox and executes the syscall on behalf of the GPU.
 
 ## Key Design Decisions
 
 | Decision | Rationale |
 |----------|-----------|
-| GCN task = real `task_struct` | Unmodified scheduler, syscall, fault handlers; task identity preserved |
-| Mailbox replaces `SYSCALL` for GCN | GCN has no `SYSCALL` instruction; doorbell → IH → `wake_up_process()` → task calls `do_syscall_64()` itself |
-| CWSR for signal preemption | GFX9 hardware saves wavefront state; fatal signals can kill GPU tasks < 100ms |
-| IOMMUv2 PPR for faults | Hardware routes GPU page faults to `handle_mm_fault()` — no custom fault routing |
-| SVM (GFX9) | `malloc()` pointers valid on both CPU and GPU; no explicit GPU VM management |
-| Build on amdkfd, don't replace it | KFD handles HSA queues, AQL dispatch (MEC), doorbell allocation |
+| `s_sendmsg` + live wavefront | Wavefront survives syscalls; no register save/restore needed |
+| Mailbox = control channel only | Data goes through separate BOs; mailbox carries only syscall_nr + args |
+| GPU addr → CPU addr translation | `hk_translate()` maps GPU BO addresses to kernel virtual addresses |
+| `static inline` + `-O2` | Avoids `buffer_store` (broken under VMID 0); everything inlines into one flat function |
+| `drm_clflush_virt_range` | CPU→GPU mailbox writes require cache flush; GPU needs `buffer_wbinvl1_vol` for reverse |
+
+## Available Syscalls
+
+| C function | Syscall | Direction |
+|-----------|---------|-----------|
+| `hk_write(mb, fd, buf, n)` | `write(fd, buf, n)` | GPU → CPU (data from any GPU buffer) |
+| `hk_read(mb, fd, buf, n)` | `read(fd, buf, n)` | CPU → GPU (data into GPU buffer) |
+| `hk_exit(mb, code)` | N/A | Terminates wavefront |
+
+## SDK
+
+The SDK packages everything a developer needs:
+
+```
+build/sdk/
+├── include/hk_libc.h      C library (read/write/exit, all inline)
+├── lib/hk.ld              Linker script
+├── bin/hk-compile         One-command compiler wrapper
+├── examples/hello.c       Hello world sample
+└── host/compute_runner.c  Host-side runner
+```
+
+See [build/sdk/README.md](build/sdk/README.md) for full documentation.
 
 ## Hardware
 
 | Component | Detail |
 |-----------|--------|
-| APU | AMD Ryzen 3 2200G (Raven Ridge, AM4) |
-| CPU | 4× Zen @ 3.5/3.7 GHz |
-| GPU | 8× GCN 5.0 CUs (Vega 8, gfx902, 512 shaders) |
-| Memory | DDR4, SVM — shared virtual address space |
-| GPU features | MEC, CWSR, XNACK, IOMMUv2 PPR |
-
-### Previous Platform (Retired)
-
-| Component | Detail |
-|-----------|--------|
-| ~~APU~~ | ~~AMD A8-7500 (Kaveri, FM2+)~~ — no MEC firmware, dispatch impossible |
+| APU | AMD Ryzen 3 2200G (Raven Ridge, gfx902, 8 CUs) |
+| Build host | EPYC workstation with ROCm 6.x toolchain |
+| Target | 2200G at 192.168.2.170, PXE boot, HeteroKern kernel |
 
 ## Build & Development
 
 Requires: ROCm 6.x toolchain, Linux 6.x kernel source.
 
 ```bash
-# Build GCN kernels (on ROCm host)
-make gcn
+# Build GCN kernels + SDK
+make gcn sdk
 
 # Build kernel (on EPYC workstation)
 make kernel
@@ -94,14 +129,8 @@ make kernel
 ./scripts/build-kernel.sh && ./scripts/kernel-test.sh
 ```
 
-Build artifacts land in `build/`. See [Roadmap.md](Roadmap.md) for the full
-development plan.
-
-## Status
-
-Platform migrated from A8-7500 to 2200G. Architecture redesigned around the
-GCN task model (real `task_struct`, unmodified kernel core). Phase 0 (2200G
-bring-up) in progress — amdgpu needs Raven firmware in kernel config.
+See [Roadmap.md](Roadmap.md) for progress and [docs/architecture-decisions.md](docs/architecture-decisions.md)
+for detailed design rationale.
 
 ## License
 
