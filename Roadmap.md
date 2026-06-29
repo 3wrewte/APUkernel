@@ -601,3 +601,6 @@ APUkernel/
 | 2026-06-23 | 4 | `conv_test.co`: 3x3 edge detection convolution on 64x64 grayscale image, 61 workgroups × 64 threads | ✅ |
 | 2026-06-23 | 4 | Convolution result: all 3844 pixels match CPU reference exactly | ✅ |
 | 2026-06-23 | 4 | GPU→CPU cache flush: `drm_clflush_virt_range` required for mailbox + input BO before dispatch | ✅ |
+| 2026-06-23 | 4 | **SYS_read implemented**: `hk_translate()` maps GPU BO addr → CPU kernel addr; `kernel_read()` writes directly into BO | ✅ |
+| 2026-06-23 | 4 | write() upgraded: arg1 as data source (GPU can write from any BO, not just mailbox data area) | ✅ |
+| 2026-06-23 | 4 | `read_test.co`: GPU calls read(fd, output_bo, 256) → reads /etc/hostname → calls write(stdout, output_bo, 19) | ✅ |

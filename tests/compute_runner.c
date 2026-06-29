@@ -350,6 +350,76 @@ static int test_convolution(const char *shader_path, int width, int height,
 
 /* ---- main ---- */
 
+/* ---- read test: GPU reads a file via read() then echoes it ---- */
+
+static int test_read(const char *shader_path, const char *file_path)
+{
+    size_t shader_sz;
+    unsigned char *shader = read_file(shader_path, &shader_sz);
+    if (!shader) return 1;
+
+    int file_fd = open(file_path, O_RDONLY);
+    if (file_fd < 0) { perror(file_path); free(shader); return 1; }
+
+    size_t out_sz = 4096;
+    unsigned char *output = malloc(out_sz);
+    memset(output, 0, out_sz);
+
+    unsigned char mailbox[4096];
+    memset(mailbox, 0, sizeof(mailbox));
+
+    /* Write fd into mailbox +0xD0 so the shader can read it */
+    *(unsigned int *)(mailbox + 0xD0) = (unsigned int)file_fd;
+
+    printf("read_test: fd=%d file=%s\n", file_fd, file_path);
+
+    int hkfd = open("/dev/heteroken", O_RDWR);
+    if (hkfd < 0) { perror("open /dev/heteroken"); free(shader); free(output);
+                     close(file_fd); return 1; }
+
+    struct hk_compute_req req = {
+        .shader_ptr  = (unsigned long long)shader,
+        .shader_size = shader_sz,
+        .vgprs       = 3,       /* shader uses v0-v9 */
+        .dispatch_x  = 1,
+        .output_ptr  = (unsigned long long)output,
+        .output_size = out_sz,
+        .dispatch_y  = 1,
+        .mailbox_ptr = (unsigned long long)mailbox,
+        .mailbox_size= sizeof(mailbox),
+        .tgid_en     = 0,
+    };
+
+    printf("dispatching read_test...\n");
+    fflush(stdout);
+
+    int ret = ioctl(hkfd, HK_IOCTL_COMPUTE, &req);
+    if (ret < 0) {
+        fprintf(stderr, "ioctl failed: %s\n", strerror(errno));
+        close(hkfd); free(shader); free(output); close(file_fd);
+        return 1;
+    }
+    close(hkfd);
+    close(file_fd);
+
+    /* Check output BO: the GPU wrote the file content here via read() */
+    long long retval = *(long long *)(mailbox + 0x38);
+    printf("read_test: GPU read() returned %lld bytes\n", retval);
+    printf("read_test: output BO first 64 bytes:\n  ");
+    for (int i = 0; i < 64 && i < (int)retval; i++)
+        printf("%02x ", output[i]);
+    printf("\n");
+
+    int ok = (retval > 0);
+    printf("read_test: %s\n", ok ? "PASS" : "FAIL");
+
+    free(shader);
+    free(output);
+    return ok ? 0 : 1;
+}
+
+/* ---- main ---- */
+
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
@@ -357,8 +427,9 @@ int main(int argc, char *argv[])
             "Usage:\n"
             "  %s vec_scale <shader.co>\n"
             "  %s multi_syscall <shader.co>\n"
-            "  %s conv <shader.co> <width> <height> <input.pgm>\n",
-            argv[0], argv[0], argv[0]);
+            "  %s conv <shader.co> <width> <height> <input.pgm>\n"
+            "  %s read <shader.co> <file>\n",
+            argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
 
@@ -378,6 +449,14 @@ int main(int argc, char *argv[])
             return 1;
         }
         return test_convolution(argv[2], atoi(argv[3]), atoi(argv[4]), argv[5]);
+    }
+
+    if (strcmp(argv[1], "read") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "read needs: <shader.co> <file>\n");
+            return 1;
+        }
+        return test_read(argv[2], argv[3]);
     }
 
     fprintf(stderr, "Unknown test: %s\n", argv[1]);

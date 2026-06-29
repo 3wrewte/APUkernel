@@ -643,6 +643,31 @@ out_free_bo:
 static struct kobj_attribute hello_attr = __ATTR_WO(hello);
 
 /* ==========================================================================
+ * GPU-to-CPU address translation
+ *
+ * Under VMID 0, all GPU-accessible addresses are GTT BOs allocated by the
+ * kernel.  We track each BO's GPU and CPU mappings so we can translate a
+ * GPU virtual address back to a CPU kernel virtual address for syscalls
+ * like read() that need the CPU to write into GPU-visible memory.
+ * ========================================================================== */
+struct hk_bo_map {
+	u64   gpu_addr;
+	void *cpu_addr;
+	u32   size;
+};
+
+static void *hk_translate(u64 gpu_addr, struct hk_bo_map *maps, int n)
+{
+	for (int i = 0; i < n; i++) {
+		if (maps[i].size && gpu_addr >= maps[i].gpu_addr &&
+		    gpu_addr < maps[i].gpu_addr + maps[i].size)
+			return (char *)maps[i].cpu_addr +
+			       (gpu_addr - maps[i].gpu_addr);
+	}
+	return NULL;
+}
+
+/* ==========================================================================
  * Character device: /dev/heteroken
  *
  * ioctl interface for userspace host_runner:
@@ -803,27 +828,60 @@ static long hk_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 			continue;
 		}
 
-		if (state == 1) {
+ 		if (state == 1) {
 			/* SYSCALL_PENDING */
-			u64 arg0 = *(u64 *)&mb32[4];
-			u64 arg2 = *(u64 *)&mb32[8];
+			u64 arg0 = *(u64 *)&mb32[4];   /* +0x10: fd */
+			u64 arg1 = *(u64 *)&mb32[6];   /* +0x18: buffer addr / arg1 */
+			u64 arg2 = *(u64 *)&mb32[8];   /* +0x20: count */
 			char *data = (char *)&mb32[16];
 			s64 retval = 0;
 
-			pr_info("hk: syscall %u(fd=%lld, count=%lld)\n",
-				syscall_nr, arg0, arg2);
+			pr_info("hk: syscall %u(fd=%lld, buf=0x%llx, count=%lld)\n",
+				syscall_nr, arg0, arg1, arg2);
 
 			switch (syscall_nr) {
+			case 0: { /* SYS_read — CPU reads file into GPU BO */
+				struct fd f = fdget((int)arg0);
+				if (!fd_empty(f)) {
+					struct hk_bo_map maps[] = {
+						{ mb_gpu_addr, mb_cpu, req.result_size },
+					};
+					void *buf = hk_translate(arg1, maps, 1);
+					if (buf) {
+						loff_t pos = 0;
+						retval = kernel_read(fd_file(f),
+								     buf,
+								     (size_t)arg2,
+								     &pos);
+						if (retval > 0)
+							drm_clflush_virt_range(buf, retval);
+					} else
+						retval = -EFAULT;
+					fdput(f);
+				} else
+					retval = -EBADF;
+				break;
+			}
 			case 1: { /* SYS_write */
 				struct fd f = fdget((int)arg0);
 				if (!fd_empty(f)) {
-					loff_t pos = 0;
-					retval = kernel_write(fd_file(f), data,
-							      (size_t)arg2, &pos);
+					char *wdata = data;
+					if (arg1) {
+						struct hk_bo_map wmaps[] = {
+							{ mb_gpu_addr, mb_cpu, req.result_size },
+						};
+						wdata = hk_translate(arg1, wmaps, 1);
+					}
+					if (wdata) {
+						loff_t pos = 0;
+						retval = kernel_write(fd_file(f),
+								      wdata,
+								      (size_t)arg2, &pos);
+					} else
+						retval = -EFAULT;
 					fdput(f);
-				} else {
+				} else
 					retval = -EBADF;
-				}
 				break;
 			}
 			default:
@@ -1050,22 +1108,72 @@ static long hk_ioctl_compute(struct file *f, unsigned int cmd, unsigned long arg
 			continue;
 		}
 
-		if (state == 1) {
-			u64 arg0 = *(u64 *)&mb32[4];
-			u64 arg2 = *(u64 *)&mb32[8];
+ 		if (state == 1) {
+			u64 arg0 = *(u64 *)&mb32[4];   /* +0x10: fd */
+			u64 arg1 = *(u64 *)&mb32[6];   /* +0x18: buffer addr */
+			u64 arg2 = *(u64 *)&mb32[8];   /* +0x20: count */
 			char *data = (char *)&mb32[16];
 			s64 retval = 0;
 
-			pr_info("hk: compute syscall %u(fd=%lld, count=%lld)\n",
-				syscall_nr, arg0, arg2);
+			pr_info("hk: compute syscall %u(fd=%lld, buf=0x%llx, count=%lld)\n",
+				syscall_nr, arg0, arg1, arg2);
 
 			switch (syscall_nr) {
+			case 0: { /* SYS_read — CPU reads into GPU BO */
+				struct fd fdfd = fdget((int)arg0);
+				if (!fd_empty(fdfd)) {
+					struct hk_bo_map maps[3];
+					int nmaps = 0;
+					if (out_bo) {
+						maps[nmaps].gpu_addr = out_gpu_addr;
+						maps[nmaps].cpu_addr = out_cpu;
+						maps[nmaps].size = req.output_size;
+						nmaps++;
+					}
+					if (in_bo) {
+						maps[nmaps].gpu_addr = in_gpu_addr;
+						maps[nmaps].cpu_addr = in_cpu;
+						maps[nmaps].size = req.input_size;
+						nmaps++;
+					}
+					maps[nmaps].gpu_addr = mb_gpu_addr;
+					maps[nmaps].cpu_addr = mb_cpu;
+					maps[nmaps].size = 4096;
+					nmaps++;
+					{
+						void *buf = hk_translate(arg1, maps, nmaps);
+						if (buf) {
+							loff_t pos = 0;
+							retval = kernel_read(fd_file(fdfd), buf,
+									     (size_t)arg2, &pos);
+							if (retval > 0)
+								drm_clflush_virt_range(buf, retval);
+						} else
+							retval = -EFAULT;
+					}
+					fdput(fdfd);
+				} else
+					retval = -EBADF;
+				break;
+			}
 			case 1: {
 				struct fd fdfd = fdget((int)arg0);
 				if (!fd_empty(fdfd)) {
-					loff_t pos = 0;
-					retval = kernel_write(fd_file(fdfd), data,
-							      (size_t)arg2, &pos);
+					char *wdata = data;
+					if (arg1) {
+						struct hk_bo_map wmaps[3];
+						int wn = 0;
+						if (out_bo) { wmaps[wn].gpu_addr = out_gpu_addr; wmaps[wn].cpu_addr = out_cpu; wmaps[wn].size = req.output_size; wn++; }
+						if (in_bo)  { wmaps[wn].gpu_addr = in_gpu_addr;  wmaps[wn].cpu_addr = in_cpu;  wmaps[wn].size = req.input_size;  wn++; }
+						wmaps[wn].gpu_addr = mb_gpu_addr; wmaps[wn].cpu_addr = mb_cpu; wmaps[wn].size = 4096; wn++;
+						wdata = hk_translate(arg1, wmaps, wn);
+					}
+					if (wdata) {
+						loff_t pos = 0;
+						retval = kernel_write(fd_file(fdfd), wdata,
+								      (size_t)arg2, &pos);
+					} else
+						retval = -EFAULT;
 					fdput(fdfd);
 				} else
 					retval = -EBADF;
